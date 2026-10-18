@@ -1,6 +1,8 @@
 use crate::dom::{
     ContentBlock, ContentKind, ContentNode, Document, FormDefinition, InteractiveElement,
+    InteractiveKind,
 };
+use std::collections::HashMap;
 use unicode_width::UnicodeWidthChar;
 
 /// A renderer-neutral semantic node. Terminal renderers and future browser-backed
@@ -161,8 +163,14 @@ pub fn transform_for_width(document: &Document, width: usize) -> TuiPage {
             });
         }
     } else {
+        let interactive: HashMap<&str, &InteractiveElement> = document
+            .interactive
+            .iter()
+            .filter(|item| matches!(item.kind, InteractiveKind::Input | InteractiveKind::Button))
+            .map(|item| (item.id.as_str(), item))
+            .collect();
         for node in &document.content {
-            children.push(map_node(node, &document.interactive));
+            children.push(map_node(node, &interactive));
         }
     }
     if !document.unsupported_elements.is_empty() {
@@ -217,11 +225,41 @@ pub fn layout_components(root: &Component, width: usize) -> Vec<String> {
     }
     for line in &mut lines {
         *line = truncate_line(line, hints.content_width);
+        strip_terminal_controls_in_place(line);
     }
     lines
 }
 
-fn map_node(node: &ContentNode, interactive: &[InteractiveElement]) -> Component {
+/// Strip terminal control characters from text originating outside the UI.
+/// Ratatui writes text to the terminal as-is, so an embedded ESC could otherwise
+/// be interpreted as a terminal command by some terminal emulators.
+pub fn strip_terminal_controls(text: &str) -> String {
+    if !has_terminal_controls(text) {
+        return text.to_owned();
+    }
+    text.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+/// Sanitize an owned display string without allocating a second copy.
+pub fn strip_terminal_controls_in_place(text: &mut String) {
+    if has_terminal_controls(text) {
+        text.retain(|ch| !ch.is_control());
+    }
+}
+
+fn has_terminal_controls(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| {
+        *byte < 0x20
+            || *byte == 0x7f
+            || (*byte == 0xc2
+                && bytes
+                    .get(index + 1)
+                    .is_some_and(|next| (0x80..=0x9f).contains(next)))
+    })
+}
+
+fn map_node(node: &ContentNode, interactive: &HashMap<&str, &InteractiveElement>) -> Component {
     let children = node
         .children
         .iter()
@@ -276,7 +314,7 @@ fn map_node(node: &ContentNode, interactive: &[InteractiveElement]) -> Component
             method: method.clone(),
         },
         ContentKind::Input { interactive_id } => {
-            let item = interactive.iter().find(|item| item.id == *interactive_id);
+            let item = interactive.get(interactive_id.as_str()).copied();
             ComponentKind::Input {
                 interactive_id: interactive_id.clone(),
                 label: item.map(|i| i.label.clone()).unwrap_or_default(),
@@ -287,7 +325,7 @@ fn map_node(node: &ContentNode, interactive: &[InteractiveElement]) -> Component
             }
         }
         ContentKind::Button { interactive_id } => {
-            let item = interactive.iter().find(|item| item.id == *interactive_id);
+            let item = interactive.get(interactive_id.as_str()).copied();
             ComponentKind::Button {
                 interactive_id: interactive_id.clone(),
                 label: item.map(|i| i.label.clone()).unwrap_or_default(),
@@ -716,7 +754,10 @@ fn truncate_line(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComponentKind, TableMode, transform, transform_for_width, wrap_text};
+    use super::{
+        Component, ComponentKind, TableMode, layout_components, transform, transform_for_width,
+        wrap_text,
+    };
     use crate::{dom::Document, html};
 
     #[test]
@@ -776,6 +817,24 @@ mod tests {
                 .all(|line| super::display_width(line) <= narrow.layout.content_width)
         );
         assert!(narrow.lines.len() > wide.lines.len());
+    }
+
+    #[test]
+    fn removes_terminal_control_sequences_from_untrusted_component_text() {
+        let root = Component {
+            kind: ComponentKind::Page {
+                title: "t".into(),
+                url: "u".into(),
+            },
+            children: vec![Component {
+                kind: ComponentKind::TextBlock {
+                    text: "safe\u{1b}[2J text\u{009b}31m".into(),
+                },
+                children: vec![],
+            }],
+        };
+        let lines = layout_components(&root, 80);
+        assert_eq!(lines, ["safe[2J text31m"]);
     }
 
     #[test]

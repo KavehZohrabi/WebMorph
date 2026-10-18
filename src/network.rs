@@ -1,11 +1,14 @@
 use std::{
+    io,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
 use futures_util::StreamExt;
 use reqwest::{
     Client, Response, Url,
+    dns::{Addrs, Name, Resolve, Resolving},
     header::{ACCEPT, CONTENT_TYPE},
     redirect::Policy,
 };
@@ -85,18 +88,24 @@ impl HttpClient {
             .connect_timeout(config.connect_timeout)
             .timeout(config.request_timeout)
             .user_agent(&config.user_agent)
+            .dns_resolver(Arc::new(ValidatingResolver {
+                allow_private_network,
+                timeout: config.connect_timeout,
+            }))
             .redirect(Policy::custom(move |attempt| {
-                if attempt.previous().len() >= redirects {
-                    attempt.stop()
-                } else if !matches!(attempt.url().scheme(), "http" | "https") {
-                    attempt.stop()
-                } else if !allow_private_network && is_blocked_redirect(attempt.url()) {
-                    attempt.stop()
-                } else if attempt
-                    .previous()
-                    .first()
-                    .is_some_and(|first| first.host_str() != attempt.url().host_str())
-                {
+                let target = attempt.url();
+                let blocked = attempt.previous().len() >= redirects
+                    || !matches!(target.scheme(), "http" | "https")
+                    || !allow_private_network && is_blocked_redirect(target)
+                    || attempt
+                        .previous()
+                        .iter()
+                        .any(|previous| previous.scheme() == "https" && target.scheme() == "http")
+                    || attempt
+                        .previous()
+                        .first()
+                        .is_some_and(|first| first.host_str() != target.host_str());
+                if blocked {
                     attempt.stop()
                 } else {
                     attempt.follow()
@@ -154,11 +163,14 @@ impl HttpClient {
         cancellation: CancellationToken,
     ) -> Result<(Url, String)> {
         let url = Self::parse_url(url.as_str())?;
-        self.check_destination(&url).await?;
         let _permit = tokio::select! {
             _ = cancellation.cancelled() => return Err(WebMorphError::Cancelled),
             permit = self.permits.clone().acquire_owned() => permit.map_err(|_| WebMorphError::Connection("request queue is closed".into()))?,
         };
+        tokio::select! {
+            _ = cancellation.cancelled() => return Err(WebMorphError::Cancelled),
+            result = self.check_destination(&url) => result?,
+        }
         debug!(host = url.host_str().unwrap_or("unknown"), "fetching page");
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(WebMorphError::Cancelled),
@@ -202,11 +214,14 @@ impl HttpClient {
     ) -> Result<(Url, String)> {
         let fields = SensitiveFields(fields);
         let url = Self::parse_url(url.as_str())?;
-        self.check_destination(&url).await?;
         let _permit = tokio::select! {
             _ = cancellation.cancelled() => return Err(WebMorphError::Cancelled),
             permit = self.permits.clone().acquire_owned() => permit.map_err(|_| WebMorphError::Connection("request queue is closed".into()))?,
         };
+        tokio::select! {
+            _ = cancellation.cancelled() => return Err(WebMorphError::Cancelled),
+            result = self.check_destination(&url) => result?,
+        }
         debug!(
             host = url.host_str().unwrap_or("unknown"),
             "submitting URL-encoded form"
@@ -316,6 +331,50 @@ impl HttpClient {
     }
 }
 
+/// Validate the addresses used by reqwest itself, closing the gap between an
+/// earlier policy lookup and the HTTP client's independent DNS lookup.
+struct ValidatingResolver {
+    allow_private_network: bool,
+    timeout: Duration,
+}
+
+impl Resolve for ValidatingResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        let allow_private_network = self.allow_private_network;
+        let resolution_timeout = self.timeout;
+        Box::pin(async move {
+            let addresses = match timeout(resolution_timeout, lookup_host((host.as_str(), 0))).await
+            {
+                Ok(Ok(addresses)) => addresses.collect::<Vec<_>>(),
+                Ok(Err(error)) => return Err(Box::new(error) as _),
+                Err(_) => {
+                    return Err(Box::new(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS resolution timed out",
+                    )) as _);
+                }
+            };
+            if addresses.is_empty() {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "hostname resolved to no addresses",
+                )) as _);
+            }
+            if !allow_private_network
+                && addresses.iter().any(|address| is_non_public(&address.ip()))
+            {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "local or private network destinations are blocked",
+                )) as _);
+            }
+            let resolved: Addrs = Box::new(addresses.into_iter());
+            Ok(resolved)
+        })
+    }
+}
+
 fn is_non_public(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -326,12 +385,24 @@ fn is_non_public(ip: &IpAddr) -> bool {
                 || ip.is_unspecified()
                 || ip.octets()[0] == 0
                 || ip.octets()[0] >= 224
+                || is_special_ipv4(ip.octets())
         }
         IpAddr::V6(ip) => {
             let s = ip.segments();
-            !(s[0] & 0xfe00 == 0x2000) || ip.is_loopback() || ip.is_unspecified()
+            !(s[0] & 0xfe00 == 0x2000)
+                || ip.is_loopback()
+                || ip.is_unspecified()
+                || (s[0] == 0x2001 && (s[1] <= 0x01ff || s[1] == 0x0db8))
+                || s[0] == 0x2002
         }
     }
+}
+
+fn is_special_ipv4(octets: [u8; 4]) -> bool {
+    matches!(octets, [100, 64..=127, _, _])
+        || matches!(octets, [192, 0, 0, _] | [192, 0, 2, _] | [192, 88, 99, _])
+        || matches!(octets, [198, 18..=19, _, _] | [198, 51, 100, _])
+        || matches!(octets, [203, 0, 113, _])
 }
 
 /// Resolve and validate a public destination for browser-backed navigation.
@@ -389,7 +460,12 @@ fn classify_reqwest(error: reqwest::Error) -> WebMorphError {
         WebMorphError::Timeout
     } else if error.is_connect() {
         let msg = error.to_string();
-        if msg.to_ascii_lowercase().contains("dns") || msg.to_ascii_lowercase().contains("resolve")
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("timed out") || lower.contains("timeout") {
+            WebMorphError::Timeout
+        } else if ["dns", "resolve", "lookup", "name or service"]
+            .iter()
+            .any(|part| lower.contains(part))
         {
             WebMorphError::Dns(msg)
         } else {
@@ -402,10 +478,12 @@ fn classify_reqwest(error: reqwest::Error) -> WebMorphError {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpClient, HttpConfig};
+    use super::{HttpClient, HttpConfig, is_non_public};
+    use std::time::Duration;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::oneshot,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -465,6 +543,16 @@ mod tests {
             HttpClient::resolve_url(&base, "../next").unwrap().as_str(),
             "https://example.com/next"
         );
+    }
+
+    #[test]
+    fn blocks_reserved_non_public_address_ranges() {
+        for address in ["100.64.0.1", "192.0.2.1", "198.18.0.1", "203.0.113.1"] {
+            assert!(is_non_public(&address.parse().unwrap()), "{address}");
+        }
+        for address in ["2001:db8::1", "2002::1"] {
+            assert!(is_non_public(&address.parse().unwrap()), "{address}");
+        }
     }
 
     #[tokio::test]
@@ -539,5 +627,80 @@ mod tests {
             local_client().get_text_cancellable(&parsed, token).await,
             Err(crate::error::WebMorphError::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_active_slow_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started, accepted) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = started.send(());
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let token = CancellationToken::new();
+        let client = local_client();
+        let url = HttpClient::parse_url(&format!("http://{address}/slow")).unwrap();
+        let request = tokio::spawn({
+            let token = token.clone();
+            async move { client.get_text_cancellable(&url, token).await }
+        });
+        accepted.await.unwrap();
+        token.cancel();
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(crate::error::WebMorphError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn limits_parallel_network_requests() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        tokio::spawn({
+            let active = active.clone();
+            let maximum = maximum.clone();
+            async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let active = active.clone();
+                    let maximum = maximum.clone();
+                    tokio::spawn(async move {
+                        let mut request = [0; 1024];
+                        let _ = socket.read(&mut request).await;
+                        let now = active.fetch_add(1, Ordering::Relaxed) + 1;
+                        maximum.fetch_max(now, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        let body = "<p>ok</p>";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    });
+                }
+            }
+        });
+        let client = HttpClient::new(HttpConfig {
+            allow_private_network: true,
+            max_concurrent_requests: 1,
+            ..HttpConfig::default()
+        })
+        .unwrap();
+        let url = HttpClient::parse_url(&format!("http://{address}/bounded")).unwrap();
+        let (first, second) = tokio::join!(client.get_text(&url), client.get_text(&url));
+        assert!(first.is_ok() && second.is_ok());
+        assert_eq!(maximum.load(Ordering::Relaxed), 1);
     }
 }

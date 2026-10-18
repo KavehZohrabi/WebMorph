@@ -1,5 +1,9 @@
 use reqwest::Url;
 use scraper::{ElementRef, Html, Selector};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::OnceLock,
+};
 
 use crate::dom::{
     ContentBlock, ContentKind, ContentNode, Document, FormControl, FormDefinition,
@@ -46,9 +50,30 @@ pub fn parse(url: &str, source: &str) -> Document {
 }
 
 fn select_first<'a>(html: &'a Html, selector: &str) -> Option<ElementRef<'a>> {
-    Selector::parse(selector)
-        .ok()
-        .and_then(|s| html.select(&s).next())
+    html.select(cached_selector(selector)).next()
+}
+
+fn cached_selector(selector: &str) -> &'static Selector {
+    static SELECTORS: OnceLock<HashMap<&'static str, Selector>> = OnceLock::new();
+    let selectors = SELECTORS.get_or_init(|| {
+        [
+            "title",
+            "body",
+            "html",
+            "base[href]",
+            "html[lang]",
+            "meta[name='description']",
+            "form",
+            "input, textarea, select, button",
+            "option",
+            "option[selected]",
+            "label[for]",
+        ]
+        .into_iter()
+        .filter_map(|value| Selector::parse(value).ok().map(|parsed| (value, parsed)))
+        .collect()
+    });
+    selectors.get(selector).expect("known static HTML selector")
 }
 
 fn walk_children(
@@ -278,7 +303,6 @@ fn parse_element(
                 walk_children(element, base, document, ordinal)
                     .into_iter()
                     .next()
-                    .map(|node| node)
             }
         }
     }
@@ -318,15 +342,40 @@ fn add_interactive(
 }
 
 fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<FormDefinition> {
-    let Ok(form_selector) = Selector::parse("form") else {
-        return Vec::new();
-    };
-    let Ok(control_selector) = Selector::parse("input, textarea, select, button") else {
-        return Vec::new();
-    };
+    let form_selector = cached_selector("form");
+    let control_selector = cached_selector("input, textarea, select, button");
     let mut forms = Vec::new();
+    let mut ids_by_html: HashMap<&str, VecDeque<&str>> = HashMap::new();
+    let mut ids_by_name_type: HashMap<&str, HashMap<&str, VecDeque<&str>>> = HashMap::new();
+    for item in &document.interactive {
+        if !matches!(item.kind, InteractiveKind::Input | InteractiveKind::Button) {
+            continue;
+        }
+        if let Some(id) = &item.html_id {
+            ids_by_html
+                .entry(id)
+                .or_default()
+                .push_back(item.id.as_str());
+        }
+        if let (Some(name), Some(input_type)) = (&item.name, &item.input_type) {
+            ids_by_name_type
+                .entry(name.as_str())
+                .or_default()
+                .entry(input_type.as_str())
+                .or_default()
+                .push_back(item.id.as_str());
+        }
+    }
     let mut claimed = std::collections::HashSet::new();
-    for (index, form) in html.select(&form_selector).enumerate() {
+    let mut labels = HashMap::new();
+    for label in html.select(cached_selector("label[for]")) {
+        if let Some(id) = label.value().attr("for") {
+            labels
+                .entry(id.to_owned())
+                .or_insert_with(|| text_of(label));
+        }
+    }
+    for (index, form) in html.select(form_selector).enumerate() {
         let action = resolve(base, form.value().attr("action"))
             .or_else(|| base.map(ToString::to_string))
             .unwrap_or_default();
@@ -341,7 +390,7 @@ fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<
             .unwrap_or("application/x-www-form-urlencoded")
             .to_ascii_lowercase();
         let mut controls = Vec::new();
-        for element in form.select(&control_selector) {
+        for element in form.select(control_selector) {
             if element.value().attr("form").is_some() {
                 continue;
             }
@@ -362,23 +411,33 @@ fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<
             };
             let name = element.value().attr("name").map(str::to_owned);
             let html_id = element.value().attr("id");
-            let matching = document.interactive.iter().find(|item| {
-                !claimed.contains(&item.id)
-                    && matches!(item.kind, InteractiveKind::Input | InteractiveKind::Button)
-                    && (html_id.is_some() && item.html_id.as_deref() == html_id
-                        || html_id.is_none()
-                            && item.name == name
-                            && item.input_type.as_deref() == Some(control_type.as_str()))
-            });
-            let Some(interactive) = matching else {
+            let queue = if let Some(id) = html_id {
+                ids_by_html.get_mut(id)
+            } else {
+                name.as_deref().and_then(|name| {
+                    ids_by_name_type
+                        .get_mut(name)
+                        .and_then(|types| types.get_mut(control_type.as_str()))
+                })
+            };
+            let Some(queue) = queue else {
                 continue;
             };
-            let interactive_id = interactive.id.clone();
-            claimed.insert(interactive_id.clone());
+            let interactive_id = loop {
+                let Some(candidate) = queue.pop_front() else {
+                    break None;
+                };
+                if claimed.insert(candidate) {
+                    break Some(candidate);
+                }
+            };
+            let Some(interactive_id) = interactive_id else {
+                continue;
+            };
             let options = if tag == "select" {
-                let selector = Selector::parse("option").expect("static selector");
+                let selector = cached_selector("option");
                 element
-                    .select(&selector)
+                    .select(selector)
                     .map(|option| {
                         let value = option
                             .value()
@@ -394,9 +453,9 @@ fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<
             let value = match tag {
                 "textarea" => element.text().collect::<String>().replace("\r\n", "\n"),
                 "select" => {
-                    let selector = Selector::parse("option[selected]").expect("static selector");
+                    let selector = cached_selector("option[selected]");
                     element
-                        .select(&selector)
+                        .select(selector)
                         .next()
                         .map(|option| {
                             option
@@ -421,12 +480,10 @@ fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<
                         }
                     }),
             };
-            let associated_label = element.value().attr("id").and_then(|id| {
-                let selector = Selector::parse("label[for]").ok()?;
-                html.select(&selector)
-                    .find(|label| label.value().attr("for") == Some(id))
-                    .map(text_of)
-            });
+            let associated_label = element
+                .value()
+                .attr("id")
+                .and_then(|id| labels.get(id).cloned());
             let label = element
                 .value()
                 .attr("aria-label")
@@ -436,7 +493,7 @@ fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<
                 .or_else(|| name.clone())
                 .unwrap_or_default();
             controls.push(FormControl {
-                interactive_id,
+                interactive_id: interactive_id.to_owned(),
                 name,
                 control_type,
                 value,
@@ -464,7 +521,7 @@ fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<
             method,
             enctype,
             requires_javascript: form.value().attrs().any(|(name, _)| name.starts_with("on"))
-                || form.select(&control_selector).any(|control| {
+                || form.select(control_selector).any(|control| {
                     control
                         .value()
                         .attrs()

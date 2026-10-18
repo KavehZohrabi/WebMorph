@@ -35,10 +35,14 @@ use crate::{
     network::HttpClient,
     plugins::PluginRegistry,
     storage::Storage,
-    transform::{ComponentKind, TuiPage, layout_components, transform},
+    transform::{
+        ComponentKind, TuiPage, layout_components, strip_terminal_controls,
+        strip_terminal_controls_in_place, transform,
+    },
 };
 
 const TICK: Duration = Duration::from_millis(35);
+const MAX_LAYOUT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 type FormValues = HashMap<String, Zeroizing<String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +82,7 @@ struct BrowserTab {
     selected_interactive: usize,
     request_id: u64,
     form_values: FormValues,
+    layout_cache: Option<(usize, u64, Vec<String>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +159,7 @@ impl UiState {
             selected_interactive: 0,
             request_id: 0,
             form_values,
+            layout_cache: None,
         };
         Self {
             tabs: vec![tab],
@@ -687,6 +693,7 @@ impl UiState {
 
     fn select_tab(&mut self, delta: isize) {
         self.tab_mut().selected_interactive = self.selected_interactive;
+        self.tab_mut().layout_cache = None;
         self.active_tab =
             (self.active_tab as isize + delta).rem_euclid(self.tabs.len() as isize) as usize;
         self.address = self.tab().url.clone();
@@ -697,6 +704,7 @@ impl UiState {
     }
 
     fn append_new_tab(&mut self, url: String) {
+        self.tab_mut().layout_cache = None;
         let page = transform(&Document::new(url.clone(), "New tab"));
         let form_values = default_form_values(&page.forms);
         let id = self.next_tab_id;
@@ -714,6 +722,7 @@ impl UiState {
             selected_interactive: 0,
             request_id: 0,
             form_values,
+            layout_cache: None,
         });
         self.active_tab = self.tabs.len() - 1;
         self.address.clear();
@@ -775,6 +784,7 @@ impl UiState {
                 } else if (full || compact) && y >= tabs_start && y < if full { 6 } else { 3 } {
                     let x = mouse.column.saturating_sub(area.x) as usize;
                     if self.tabs.len() > 0 {
+                        self.tab_mut().layout_cache = None;
                         self.active_tab = (x
                             / (area.width.max(1) as usize / self.tabs.len()).max(1))
                         .min(self.tabs.len() - 1);
@@ -924,6 +934,27 @@ impl TerminalSession {
         tokio::pin!(shutdown);
         loop {
             if state.dirty {
+                let width = self.terminal.size()?.width.saturating_sub(2).max(1) as usize;
+                for (index, tab) in state.tabs.iter_mut().enumerate() {
+                    if index != state.active_tab {
+                        tab.layout_cache = None;
+                    }
+                }
+                let tab = state.tab_mut();
+                if tab
+                    .layout_cache
+                    .as_ref()
+                    .is_none_or(|(cached_width, request, _)| {
+                        *cached_width != width || *request != tab.request_id
+                    })
+                {
+                    let lines = layout_components(&tab.page.root, width);
+                    let bytes = lines
+                        .iter()
+                        .fold(0usize, |total, line| total.saturating_add(line.len()));
+                    tab.layout_cache =
+                        (bytes <= MAX_LAYOUT_CACHE_BYTES).then_some((width, tab.request_id, lines));
+                }
                 self.draw(&state)?;
                 state.dirty = false;
             }
@@ -941,7 +972,7 @@ impl TerminalSession {
                                             tracing::warn!(%error, "failed to persist browsing history");
                                         }
                                     }
-                                    tab.title = page.title.clone(); tab.url = final_url.clone(); tab.form_values = default_form_values(&page.forms); tab.page = page; tab.scroll = 0;
+                                    tab.title = page.title.clone(); tab.url = final_url.clone(); tab.form_values = default_form_values(&page.forms); tab.page = page; tab.scroll = 0; tab.layout_cache = None;
                                     tab.selected_interactive = 0;
                                     if let Some(index) = result.history_target { tab.history_index = index; tab.history[index] = final_url.clone(); }
                                     else { tab.history.truncate(tab.history_index.saturating_add(1)); if tab.history.last() != Some(&final_url) { tab.history.push(final_url.clone()); } tab.history_index = tab.history.len().saturating_sub(1); }
@@ -1065,7 +1096,8 @@ impl TerminalSession {
                 for (i, tab) in state.tabs.iter().enumerate() {
                     let marker = if tab.loading { " *" } else { "" };
                     let style = if i == state.active_tab { theme.selected } else { theme.muted };
-                    tab_spans.push(Span::styled(format!(" {}{}{} ", i + 1, tab.title, marker), style));
+                    let title = strip_terminal_controls(&tab.title);
+                    tab_spans.push(Span::styled(format!(" {}{}{} ", i + 1, title, marker), style));
                 }
                 let tabs_widget = Paragraph::new(Line::from(tab_spans));
                 if tabs_area.height > 1 {
@@ -1077,25 +1109,37 @@ impl TerminalSession {
             let tab = state.tab();
             if tab.loading {
                 let spinner = spinner(state.loading_frame, self.ascii);
-                let label = format!("{spinner} Loading {}", tab.url);
-                frame.render_widget(Paragraph::new(if self.ascii { to_ascii(&label) } else { label }).block(Block::default().title(tab.title.as_str()).borders(Borders::ALL).border_style(theme.border).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), content_area);
+                let label = strip_terminal_controls(&format!("{spinner} Loading {}", tab.url));
+                let safe_title = strip_terminal_controls(&tab.title);
+                frame.render_widget(Paragraph::new(if self.ascii { to_ascii(&label) } else { label }).block(Block::default().title(safe_title).borders(Borders::ALL).border_style(theme.border).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), content_area);
             } else if let Some(error) = &tab.error {
-                let lines = vec![Line::styled("Unable to open this page", theme.error.add_modifier(Modifier::BOLD)), Line::raw(""), Line::raw(error.clone()), Line::raw(""), Line::styled("Edit the address and press Enter to try again.", theme.muted)];
+                let safe_error = strip_terminal_controls(error);
+                let lines = vec![Line::styled("Unable to open this page", theme.error.add_modifier(Modifier::BOLD)), Line::raw(""), Line::raw(safe_error), Line::raw(""), Line::styled("Edit the address and press Enter to try again.", theme.muted)];
                 frame.render_widget(Paragraph::new(Text::from(lines)).block(Block::default().title("Load error").borders(Borders::ALL).border_style(theme.error).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), content_area);
             } else {
-                let page_lines = layout_components(&tab.page.root, content_area.width as usize);
+                let fallback_lines;
+                let page_lines = if let Some((_, _, lines)) = &tab.layout_cache {
+                    lines.as_slice()
+                } else {
+                    fallback_lines = layout_components(&tab.page.root, content_area.width as usize);
+                    fallback_lines.as_slice()
+                };
                 let controls = interactive_targets(&tab.page);
                 let mut lines = Vec::new();
-                for text in page_lines.iter() {
-                    let shown = render_form_line(text, &controls, tab);
+                let visible_rows = content_area.height.saturating_sub(2) as usize;
+                for text in visible_window(page_lines, tab.scroll, visible_rows) {
+                    let mut shown = render_form_line(text, &controls, tab);
+                    strip_terminal_controls_in_place(&mut shown);
                     let shown = if self.ascii { to_ascii(&shown) } else { shown };
                     let selected = state.focus == Focus::Content && controls.get(state.selected_interactive).is_some_and(|c| shown.contains(&format!("[{}]", c.id)));
                     lines.push(Line::styled(shown, if selected { theme.selected } else { theme.base }));
                 }
-                frame.render_widget(Paragraph::new(Text::from(lines)).block(Block::default().title(tab.title.as_str()).borders(Borders::ALL).border_style(if state.focus == Focus::Content { theme.accent } else { theme.border }).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }).scroll((tab.scroll.min(u16::MAX as usize) as u16, 0)), content_area);
+                let safe_title = strip_terminal_controls(&tab.title);
+                frame.render_widget(Paragraph::new(Text::from(lines)).block(Block::default().title(safe_title).borders(Borders::ALL).border_style(if state.focus == Focus::Content { theme.accent } else { theme.border }).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), content_area);
             }
             if status_area.height > 0 {
                 let label = if state.tab().loading { format!("LOADING  {}", state.tab().url) } else if state.tab().error.is_some() { format!("ERROR  {}", state.status) } else { format!("{}  ·  {}", state.status, state.tab().url) };
+                let label = strip_terminal_controls(&label);
                 let label = if self.ascii { to_ascii(&label) } else { label };
                 frame.render_widget(Paragraph::new(label).style(if state.tab().error.is_some() { theme.error } else { theme.status }), status_area);
             }
@@ -1119,6 +1163,12 @@ impl TerminalSession {
         })?;
         Ok(())
     }
+}
+
+fn visible_window<T>(items: &[T], start: usize, count: usize) -> &[T] {
+    let start = start.min(items.len());
+    let end = start.saturating_add(count).min(items.len());
+    &items[start..end]
 }
 
 fn begin_navigation(
@@ -1724,7 +1774,8 @@ fn address_window(text: &str, cursor: usize, width: usize, focused: bool, ascii:
     if width == 0 {
         return String::new();
     }
-    let chars: Vec<char> = text.chars().collect();
+    let safe_text = strip_terminal_controls(text);
+    let chars: Vec<char> = safe_text.chars().collect();
     let cursor = cursor.min(chars.len());
     let marker = if focused {
         Some(if ascii { '|' } else { '▏' })
@@ -1836,6 +1887,7 @@ impl Drop for TerminalSession {
 mod tests {
     use super::{
         CancellationToken, Focus, HashMap, HttpClient, Theme, UiAction, UiState, Zeroizing, mpsc,
+        visible_window,
     };
     use crate::{dom::Document, html, transform::transform};
     use crossterm::event::{
@@ -1848,6 +1900,14 @@ mod tests {
             "<nav><a href='/home'>Home</a></nav><p>Body</p>",
         );
         UiState::new(transform(&doc))
+    }
+
+    #[test]
+    fn visible_window_limits_scrolling_work_to_the_viewport() {
+        let rows: Vec<_> = (0..10_000).collect();
+        assert_eq!(visible_window(&rows, 0, 3), [0, 1, 2]);
+        assert_eq!(visible_window(&rows, 5_000, 2), [5_000, 5_001]);
+        assert_eq!(visible_window(&rows, 20_000, 3), []);
     }
 
     fn form_state(source: &str) -> UiState {
