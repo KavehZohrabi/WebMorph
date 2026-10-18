@@ -10,6 +10,12 @@ pub enum Verbosity {
     Trace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EngineChoice {
+    Lightweight,
+    Chromium,
+}
+
 impl Verbosity {
     fn as_filter(self) -> &'static str {
         match self {
@@ -35,6 +41,10 @@ pub struct Cli {
     #[arg(long)]
     pub private: bool,
 
+    /// Select the rendering engine (Chromium requires `--features browser-engine`)
+    #[arg(long, value_enum, default_value = "lightweight")]
+    pub engine: EngineChoice,
+
     /// Set log verbosity (overridden by RUST_LOG when present)
     #[arg(short, long, value_enum, default_value = "warn")]
     pub verbosity: Verbosity,
@@ -52,7 +62,7 @@ impl Cli {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Verbosity};
+    use super::{Cli, EngineChoice, Verbosity};
 
     #[test]
     fn parses_url_and_verbosity() {
@@ -60,5 +70,12 @@ mod tests {
             .expect("valid arguments");
         assert_eq!(cli.url.as_deref(), Some("https://example.com"));
         assert!(matches!(cli.verbosity, Verbosity::Debug));
+    }
+
+    #[test]
+    fn chromium_engine_requires_explicit_selection() {
+        let cli = Cli::try_parse_from(["webmorph", "--engine", "chromium", "https://example.com"])
+            .expect("valid Chromium engine option");
+        assert!(matches!(cli.engine, EngineChoice::Chromium));
     }
 }

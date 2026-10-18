@@ -8,7 +8,7 @@ readme = "README.md"
 
 [features]
 default = []
-browser-engine = []
+browser-engine = ["dep:chromiumoxide", "dep:tempfile", "dep:serde_json"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -27,6 +27,9 @@ unicode-width = "0.2"
 zeroize = "1.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 dirs = "6"
+chromiumoxide = { version = "0.9.1", default-features = false, optional = true }
+tempfile = { version = "3", optional = true }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

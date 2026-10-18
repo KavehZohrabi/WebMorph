@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, Stdout},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -27,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::{
+    browser::BrowserBackend,
     dom::{Document, FormControl, FormDefinition},
     error::{Result, WebMorphError},
     html,
@@ -125,6 +127,7 @@ struct UiState {
     loading_frame: usize,
     dirty: bool,
     editing_field: Option<String>,
+    browser_backend: Option<Arc<dyn BrowserBackend>>,
 }
 
 impl UiState {
@@ -167,6 +170,7 @@ impl UiState {
             loading_frame: 0,
             dirty: true,
             editing_field: None,
+            browser_backend: None,
         }
     }
 
@@ -885,9 +889,12 @@ impl TerminalSession {
         url: String,
         client: HttpClient,
         storage: Storage,
+        browser_backend: Option<Arc<dyn BrowserBackend>>,
     ) -> Result<()> {
         let placeholder = transform(&Document::new(url.clone(), "Loading"));
         let state = UiState::new(placeholder);
+        let mut state = state;
+        state.browser_backend = browser_backend;
         self.run_state(state, Some((url, client, Some(storage))))
             .await
     }
@@ -1156,6 +1163,11 @@ fn begin_navigation_request(
     history_target: Option<usize>,
     post_fields: Option<Vec<(String, String)>>,
 ) {
+    if post_fields.is_some() && state.browser_backend.is_some() {
+        state.status = "Chromium mode does not support form submission yet".into();
+        state.dirty = true;
+        return;
+    }
     if url.trim().is_empty() {
         state.status = "Enter an HTTP or HTTPS address".into();
         state.dirty = true;
@@ -1196,23 +1208,34 @@ fn begin_navigation_request(
     state.dirty = true;
     let tx = sender.clone();
     cancellations.insert(tab_id, token.clone());
+    let browser_backend = state.browser_backend.clone();
     tokio::spawn(async move {
         let result = async {
             let parsed = HttpClient::parse_url(&url)?;
-            let (final_url, source) = if let Some(fields) = post_fields {
-                client
+            let (mut document, final_url) = if let Some(fields) = post_fields {
+                let (final_url, source) = client
                     .submit_form_cancellable(&parsed, fields, token)
-                    .await?
+                    .await?;
+                (
+                    html::parse(final_url.as_str(), &source),
+                    final_url.to_string(),
+                )
+            } else if let Some(browser) = browser_backend {
+                let (document, final_url) = browser.render(&url, token).await?;
+                (document, final_url)
             } else {
-                client
+                let (final_url, source) = client
                     .get_text_with_final_url_cancellable(&parsed, token)
-                    .await?
+                    .await?;
+                (
+                    html::parse(final_url.as_str(), &source),
+                    final_url.to_string(),
+                )
             };
-            let mut document = html::parse(final_url.as_str(), &source);
             let report = PluginRegistry::default().process(&mut document);
             let mut page = transform(&document);
             crate::plugins::apply_report_to_page(&mut page, report);
-            Ok((page, final_url.to_string()))
+            Ok((page, final_url))
         }
         .await;
         let _ = tx.send(NavigationResult {

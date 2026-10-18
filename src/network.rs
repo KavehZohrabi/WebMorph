@@ -334,6 +334,44 @@ fn is_non_public(ip: &IpAddr) -> bool {
     }
 }
 
+/// Resolve and validate a public destination for browser-backed navigation.
+/// Returning every resolved address lets callers pin the host after validation
+/// rather than resolving it again in a child browser process.
+#[cfg(feature = "browser-engine")]
+pub(crate) async fn resolve_public_destination(url: &Url) -> Result<Vec<IpAddr>> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| WebMorphError::InvalidUrl("missing host".into()))?;
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return Err(WebMorphError::InvalidUrl(
+            "local network destinations are blocked".into(),
+        ));
+    }
+    let addresses: Vec<IpAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => {
+            let port = url.port_or_known_default().unwrap_or(80);
+            timeout(Duration::from_secs(10), lookup_host((host, port)))
+                .await
+                .map_err(|_| WebMorphError::Timeout)?
+                .map_err(|error| WebMorphError::Dns(error.to_string()))?
+                .map(|address: SocketAddr| address.ip())
+                .collect()
+        }
+    };
+    if addresses.is_empty() {
+        return Err(WebMorphError::Dns(
+            "hostname resolved to no addresses".into(),
+        ));
+    }
+    if addresses.iter().any(is_non_public) {
+        return Err(WebMorphError::InvalidUrl(
+            "local or private network destinations are blocked".into(),
+        ));
+    }
+    Ok(addresses)
+}
+
 fn is_blocked_redirect(url: &Url) -> bool {
     let Some(host) = url.host_str() else {
         return true;

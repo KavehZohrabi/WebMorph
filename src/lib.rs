@@ -10,5 +10,4 @@ pub mod storage;
 pub mod transform;
 pub mod tui;
 
-#[cfg(feature = "browser-engine")]
 pub mod browser;

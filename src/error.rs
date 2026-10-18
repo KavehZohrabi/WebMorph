@@ -24,4 +24,8 @@ pub enum WebMorphError {
     Terminal(#[from] std::io::Error),
     #[error("browser storage failed: {0}")]
     Storage(#[from] crate::storage::StorageError),
+    #[error("Chromium is unavailable: {0}")]
+    BrowserUnavailable(String),
+    #[error("Chromium engine failed: {0}")]
+    Browser(String),
 }
