@@ -24,3 +24,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 unicode-width = "0.2"
+zeroize = "1.8"

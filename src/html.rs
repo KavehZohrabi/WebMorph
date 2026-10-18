@@ -2,7 +2,8 @@ use reqwest::Url;
 use scraper::{ElementRef, Html, Selector};
 
 use crate::dom::{
-    ContentBlock, ContentKind, ContentNode, Document, InteractiveElement, InteractiveKind,
+    ContentBlock, ContentKind, ContentNode, Document, FormControl, FormDefinition,
+    InteractiveElement, InteractiveKind,
 };
 
 const IGNORED: &[&str] = &[
@@ -38,6 +39,7 @@ pub fn parse(url: &str, source: &str) -> Document {
     } else if let Some(root) = select_first(&html, "html") {
         document.content = walk_children(root, base.as_ref(), &mut document, &mut ordinal);
     }
+    document.forms = parse_forms(&html, &mut document, base.as_ref());
     // Keep the original flat API usable by the existing renderer and plugins.
     collect_legacy_blocks(&document.content, &mut document.blocks);
     document
@@ -120,6 +122,7 @@ fn parse_element(
                     None,
                     None,
                     element.value().attr("aria-disabled") == Some("true"),
+                    element.value().attr("id").map(str::to_owned),
                 )
             });
             leaf(ContentKind::Link {
@@ -198,12 +201,17 @@ fn parse_element(
                 InteractiveKind::Input,
                 label,
                 element.value().attr("name").map(str::to_owned),
-                element.value().attr("value").map(str::to_owned),
+                if input_type.eq_ignore_ascii_case("password") {
+                    None
+                } else {
+                    element.value().attr("value").map(str::to_owned)
+                },
                 Some(input_type.to_owned()),
                 None,
                 None,
                 element.value().attr("placeholder").map(str::to_owned),
                 element.value().attr("disabled").is_some(),
+                element.value().attr("id").map(str::to_owned),
             );
             leaf(ContentKind::Input { interactive_id: id })
         }
@@ -226,6 +234,7 @@ fn parse_element(
                 None,
                 None,
                 element.value().attr("disabled").is_some(),
+                element.value().attr("id").map(str::to_owned),
             );
             leaf(ContentKind::Button { interactive_id: id })
         }
@@ -288,6 +297,7 @@ fn add_interactive(
     form_action: Option<String>,
     placeholder: Option<String>,
     disabled: bool,
+    html_id: Option<String>,
 ) -> String {
     *ordinal += 1;
     let id = format!("wm-{:04}", *ordinal);
@@ -302,8 +312,168 @@ fn add_interactive(
         form_action,
         placeholder,
         disabled,
+        html_id,
     });
     id
+}
+
+fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<FormDefinition> {
+    let Ok(form_selector) = Selector::parse("form") else {
+        return Vec::new();
+    };
+    let Ok(control_selector) = Selector::parse("input, textarea, select, button") else {
+        return Vec::new();
+    };
+    let mut forms = Vec::new();
+    let mut claimed = std::collections::HashSet::new();
+    for (index, form) in html.select(&form_selector).enumerate() {
+        let action = resolve(base, form.value().attr("action"))
+            .or_else(|| base.map(ToString::to_string))
+            .unwrap_or_default();
+        let method = form
+            .value()
+            .attr("method")
+            .unwrap_or("get")
+            .to_ascii_lowercase();
+        let enctype = form
+            .value()
+            .attr("enctype")
+            .unwrap_or("application/x-www-form-urlencoded")
+            .to_ascii_lowercase();
+        let mut controls = Vec::new();
+        for element in form.select(&control_selector) {
+            if element.value().attr("form").is_some() {
+                continue;
+            }
+            let tag = element.value().name();
+            let control_type = match tag {
+                "input" => element
+                    .value()
+                    .attr("type")
+                    .unwrap_or("text")
+                    .to_ascii_lowercase(),
+                "button" => element
+                    .value()
+                    .attr("type")
+                    .unwrap_or("submit")
+                    .to_ascii_lowercase(),
+                "textarea" => "textarea".into(),
+                _ => "select".into(),
+            };
+            let name = element.value().attr("name").map(str::to_owned);
+            let html_id = element.value().attr("id");
+            let matching = document.interactive.iter().find(|item| {
+                !claimed.contains(&item.id)
+                    && matches!(item.kind, InteractiveKind::Input | InteractiveKind::Button)
+                    && (html_id.is_some() && item.html_id.as_deref() == html_id
+                        || html_id.is_none()
+                            && item.name == name
+                            && item.input_type.as_deref() == Some(control_type.as_str()))
+            });
+            let Some(interactive) = matching else {
+                continue;
+            };
+            let interactive_id = interactive.id.clone();
+            claimed.insert(interactive_id.clone());
+            let options = if tag == "select" {
+                let selector = Selector::parse("option").expect("static selector");
+                element
+                    .select(&selector)
+                    .map(|option| {
+                        let value = option
+                            .value()
+                            .attr("value")
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| text_of(option));
+                        (value, text_of(option))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let value = match tag {
+                "textarea" => element.text().collect::<String>().replace("\r\n", "\n"),
+                "select" => {
+                    let selector = Selector::parse("option[selected]").expect("static selector");
+                    element
+                        .select(&selector)
+                        .next()
+                        .map(|option| {
+                            option
+                                .value()
+                                .attr("value")
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| text_of(option))
+                        })
+                        .or_else(|| options.first().map(|(value, _)| value.clone()))
+                        .unwrap_or_default()
+                }
+                _ if control_type == "password" => String::new(),
+                _ => element
+                    .value()
+                    .attr("value")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        if matches!(control_type.as_str(), "checkbox" | "radio") {
+                            "on".into()
+                        } else {
+                            String::new()
+                        }
+                    }),
+            };
+            let associated_label = element.value().attr("id").and_then(|id| {
+                let selector = Selector::parse("label[for]").ok()?;
+                html.select(&selector)
+                    .find(|label| label.value().attr("for") == Some(id))
+                    .map(text_of)
+            });
+            let label = element
+                .value()
+                .attr("aria-label")
+                .map(str::to_owned)
+                .or(associated_label)
+                .or_else(|| element.value().attr("placeholder").map(str::to_owned))
+                .or_else(|| name.clone())
+                .unwrap_or_default();
+            controls.push(FormControl {
+                interactive_id,
+                name,
+                control_type,
+                value,
+                label,
+                required: element.value().attr("required").is_some(),
+                checked: element.value().attr("checked").is_some()
+                    || element.value().attr("selected").is_some(),
+                disabled: element.value().attr("disabled").is_some(),
+                options,
+                multiple: element.value().attr("multiple").is_some(),
+                minlength: element
+                    .value()
+                    .attr("minlength")
+                    .and_then(|v| v.parse().ok()),
+                maxlength: element
+                    .value()
+                    .attr("maxlength")
+                    .and_then(|v| v.parse().ok()),
+            });
+        }
+        forms.push(FormDefinition {
+            id: format!("wm-form-{:04}", index + 1),
+            name: form.value().attr("name").map(str::to_owned),
+            action,
+            method,
+            enctype,
+            requires_javascript: form.value().attrs().any(|(name, _)| name.starts_with("on"))
+                || form.select(&control_selector).any(|control| {
+                    control
+                        .value()
+                        .attrs()
+                        .any(|(name, _)| name.starts_with("on"))
+                }),
+            controls,
+        });
+    }
+    forms
 }
 
 fn collect_legacy_blocks(nodes: &[ContentNode], out: &mut Vec<ContentBlock>) {
@@ -448,5 +618,33 @@ mod tests {
         assert_eq!(doc.unsupported_elements, vec!["canvas", "x-widget"]);
         assert!(doc.blocks.is_empty());
         assert!(!format!("{:?}", doc.content).contains("secret"));
+    }
+
+    #[test]
+    fn parses_form_controls_validation_and_relative_actions() {
+        let doc = parse(
+            "https://example.com/search/index",
+            r#"
+            <form id="search" action="../results" method="get">
+              <input id="q" name="q" type="search" required minlength="2" placeholder="Search">
+              <input id="updates" name="updates" type="checkbox" value="yes" checked>
+              <select id="sort" name="sort"><option value="new">Newest</option><option selected>Popular</option></select>
+              <button id="go" type="submit" name="submit" value="1">Search</button>
+            </form>
+            <form action="/login" method="post"><input id="password" name="password" type="password"></form>
+        "#,
+        );
+        assert_eq!(doc.forms.len(), 2);
+        let search = &doc.forms[0];
+        assert_eq!(search.action, "https://example.com/results");
+        assert_eq!(search.method, "get");
+        assert_eq!(search.controls.len(), 4);
+        assert!(search.controls[0].required);
+        assert_eq!(search.controls[0].minlength, Some(2));
+        assert!(search.controls[1].checked);
+        assert_eq!(search.controls[2].value, "Popular");
+        assert_eq!(search.controls[2].options.len(), 2);
+        assert_eq!(doc.forms[1].controls[0].control_type, "password");
+        assert_eq!(doc.forms[1].controls[0].value, "");
     }
 }

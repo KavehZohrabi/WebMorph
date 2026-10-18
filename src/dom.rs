@@ -13,6 +13,8 @@ pub struct Document {
     #[serde(default)]
     pub interactive: Vec<InteractiveElement>,
     #[serde(default)]
+    pub forms: Vec<FormDefinition>,
+    #[serde(default)]
     pub unsupported_elements: Vec<String>,
     /// Flat compatibility view consumed by the current terminal renderer.
     #[serde(default)]
@@ -100,6 +102,36 @@ pub struct InteractiveElement {
     pub form_action: Option<String>,
     pub placeholder: Option<String>,
     pub disabled: bool,
+    #[serde(default)]
+    pub html_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormDefinition {
+    pub id: String,
+    pub name: Option<String>,
+    pub action: String,
+    pub method: String,
+    pub enctype: String,
+    #[serde(default)]
+    pub requires_javascript: bool,
+    pub controls: Vec<FormControl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormControl {
+    pub interactive_id: String,
+    pub name: Option<String>,
+    pub control_type: String,
+    pub value: String,
+    pub label: String,
+    pub required: bool,
+    pub checked: bool,
+    pub disabled: bool,
+    pub options: Vec<(String, String)>,
+    pub multiple: bool,
+    pub minlength: Option<usize>,
+    pub maxlength: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +157,7 @@ impl Document {
             metadata: PageMetadata::default(),
             content: Vec::new(),
             interactive: Vec::new(),
+            forms: Vec::new(),
             unsupported_elements: Vec::new(),
             blocks: Vec::new(),
         }

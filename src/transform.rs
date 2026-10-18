@@ -1,4 +1,6 @@
-use crate::dom::{ContentBlock, ContentKind, ContentNode, Document, InteractiveElement};
+use crate::dom::{
+    ContentBlock, ContentKind, ContentNode, Document, FormDefinition, InteractiveElement,
+};
 use unicode_width::UnicodeWidthChar;
 
 /// A renderer-neutral semantic node. Terminal renderers and future browser-backed
@@ -103,6 +105,7 @@ pub struct TuiPage {
     pub root: Component,
     pub layout: LayoutHints,
     pub lines: Vec<String>,
+    pub forms: Vec<FormDefinition>,
 }
 
 /// Transform using a conventional 80-column viewport.
@@ -184,6 +187,7 @@ pub fn transform_for_width(document: &Document, width: usize) -> TuiPage {
         root,
         layout,
         lines,
+        forms: document.forms.clone(),
     }
 }
 
@@ -407,6 +411,9 @@ fn render(component: &Component, hints: LayoutHints, depth: usize, out: &mut Vec
             value,
             disabled,
         } => {
+            if input_type.as_deref() == Some("hidden") {
+                return;
+            }
             let descriptor = if !label.is_empty() {
                 label.clone()
             } else {
