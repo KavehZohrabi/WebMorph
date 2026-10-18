@@ -276,12 +276,10 @@ fn validate_component(component: &Component, ids: &mut HashSet<String>) -> Resul
         }
         | ComponentKind::Button {
             interactive_id: id, ..
-        } => {
-            if id.trim().is_empty() || !ids.insert(id.clone()) {
-                return Err(PluginError::InvalidOutput(
-                    "interactive identifiers must be non-empty and unique".into(),
-                ));
-            }
+        } if id.trim().is_empty() || !ids.insert(id.clone()) => {
+            return Err(PluginError::InvalidOutput(
+                "interactive identifiers must be non-empty and unique".into(),
+            ));
         }
         _ => {}
     }

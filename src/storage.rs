@@ -392,9 +392,11 @@ mod tests {
             assert_eq!(db.history(10).unwrap().len(), 1);
             db.add_bookmark("https://example.com", "Example").unwrap();
             assert_eq!(db.search_bookmarks("exam", 5).unwrap().len(), 1);
-            let mut settings = AppSettings::default();
-            settings.preferred_theme = "dark".into();
-            settings.request_timeout_seconds = 9;
+            let settings = AppSettings {
+                preferred_theme: "dark".into(),
+                request_timeout_seconds: 9,
+                ..AppSettings::default()
+            };
             db.save_settings(&settings).unwrap();
         }
         let db = Storage::open(path, false).unwrap();

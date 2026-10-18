@@ -85,6 +85,11 @@ struct BrowserTab {
     layout_cache: Option<(usize, u64, Vec<String>)>,
 }
 
+struct NavigationPayload {
+    history_target: Option<usize>,
+    post_fields: Option<Vec<(String, String)>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InteractiveTarget {
     id: String,
@@ -783,7 +788,7 @@ impl UiState {
                     }
                 } else if (full || compact) && y >= tabs_start && y < if full { 6 } else { 3 } {
                     let x = mouse.column.saturating_sub(area.x) as usize;
-                    if self.tabs.len() > 0 {
+                    if !self.tabs.is_empty() {
                         self.tab_mut().layout_cache = None;
                         self.active_tab = (x
                             / (area.width.max(1) as usize / self.tabs.len()).max(1))
@@ -967,10 +972,10 @@ impl TerminalSession {
                             let tab = &mut state.tabs[index]; tab.loading = false; tab.error = None;
                             let status = match result.result {
                                 Ok((page, final_url)) => {
-                                    if let Some(storage) = storage.as_mut() {
-                                        if let Err(error) = storage.record_visit(&final_url, &page.title) {
-                                            tracing::warn!(%error, "failed to persist browsing history");
-                                        }
+                                    if let Some(storage) = storage.as_mut()
+                                        && let Err(error) = storage.record_visit(&final_url, &page.title)
+                                    {
+                                        tracing::warn!(%error, "failed to persist browsing history");
                                     }
                                     tab.title = page.title.clone(); tab.url = final_url.clone(); tab.form_values = default_form_values(&page.forms); tab.page = page; tab.scroll = 0; tab.layout_cache = None;
                                     tab.selected_interactive = 0;
@@ -1073,7 +1078,12 @@ impl TerminalSession {
                 vec![Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]
             };
             let regions = Layout::vertical(rows).split(area);
-            let (top, address_area, tabs_area, content_area, status_area, help_area) = if full { (regions[0], regions[1], regions[2], regions[3], regions[4], regions[5]) } else if compact { (regions[0], regions[1], regions[2], regions[3], regions[4], regions[5]) } else { (regions[0], regions[1], Rect::default(), regions[2], Rect::default(), Rect::default()) };
+            let (top, address_area, tabs_area, content_area, status_area, help_area) =
+                if full || compact {
+                    (regions[0], regions[1], regions[2], regions[3], regions[4], regions[5])
+                } else {
+                    (regions[0], regions[1], Rect::default(), regions[2], Rect::default(), Rect::default())
+                };
             let brand = if self.ascii { "WEBMORPH" } else { "WebMorph" };
             let (back, forward) = if self.ascii { ("<-", "->") } else { ("←", "→") };
             let nav = if area.width < 58 {
@@ -1148,13 +1158,13 @@ impl TerminalSession {
                 frame.render_widget(Paragraph::new(if self.ascii { to_ascii(help) } else { help.into() }).style(theme.muted), help_area);
             }
             if state.dialog == Some(Dialog::Help) {
-                let width = area.width.min(76).max(24); let height = area.height.min(21).max(7);
+                let width = area.width.clamp(24, 76); let height = area.height.clamp(7, 21);
                 let popup = centered(area, width, height);
                 let help = vec![Line::styled("Keyboard and mouse", theme.accent.add_modifier(Modifier::BOLD)), Line::raw(""), Line::raw("Tab / Shift+Tab  Move between controls"), Line::raw("Enter           Edit a field or activate a control"), Line::raw("Space           Toggle a checkbox or radio option"), Line::raw("Arrow keys      Scroll pages; choose select options"), Line::raw("Shift+Enter     Open a selected link in a new tab"), Line::raw("Alt+Enter       Open a selected link in system browser"), Line::raw("Ctrl+L          Focus the address bar"), Line::raw("Ctrl+T / Ctrl+W New tab / close tab"), Line::raw("Ctrl+Tab        Next tab; Ctrl+Shift+Tab previous tab"), Line::raw("h               Home (site root)"), Line::raw("[ / ]           Back / forward; r reloads"), Line::raw("Ctrl+Q          Quit"), Line::raw("Mouse           Click fields and controls; wheel to scroll"), Line::raw("POST submissions ask for confirmation"), Line::raw(""), Line::styled("Esc: close this panel", theme.muted)];
                 frame.render_widget(Clear, popup);
                 frame.render_widget(Paragraph::new(Text::from(help)).block(Block::default().title(" Help ").borders(Borders::ALL).border_style(theme.accent).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), popup);
             } else if matches!(state.dialog, Some(Dialog::ConfirmSubmit { .. })) {
-                let width = area.width.min(62).max(24); let height = area.height.min(7).max(5);
+                let width = area.width.clamp(24, 62); let height = area.height.clamp(5, 7);
                 let popup = centered(area, width, height);
                 let text = vec![Line::styled("Confirm form submission", theme.error.add_modifier(Modifier::BOLD)), Line::raw("This may send sensitive information to the website."), Line::raw("Press Enter or y to submit; Esc or n to cancel.")];
                 frame.render_widget(Clear, popup);
@@ -1198,8 +1208,10 @@ fn begin_navigation_target(
         sender,
         request_id,
         cancellations,
-        history_target,
-        None,
+        NavigationPayload {
+            history_target,
+            post_fields: None,
+        },
     );
 }
 
@@ -1210,9 +1222,12 @@ fn begin_navigation_request(
     sender: &mpsc::UnboundedSender<NavigationResult>,
     request_id: &mut u64,
     cancellations: &mut HashMap<u64, CancellationToken>,
-    history_target: Option<usize>,
-    post_fields: Option<Vec<(String, String)>>,
+    payload: NavigationPayload,
 ) {
+    let NavigationPayload {
+        history_target,
+        post_fields,
+    } = payload;
     if post_fields.is_some() && state.browser_backend.is_some() {
         state.status = "Chromium mode does not support form submission yet".into();
         state.dirty = true;
@@ -1336,6 +1351,16 @@ fn begin_form_submission(
         state.dirty = true;
         return;
     }
+    if form.method == "get"
+        && form
+            .controls
+            .iter()
+            .any(|control| control.control_type == "password")
+    {
+        state.status = "GET form with a password field blocked to protect the password from appearing in the URL".into();
+        state.dirty = true;
+        return;
+    }
     let Ok(mut action) = HttpClient::parse_url(&form.action) else {
         state.status = "Form action URL is invalid".into();
         state.dirty = true;
@@ -1351,8 +1376,10 @@ fn begin_form_submission(
             sender,
             request_id,
             cancellations,
-            None,
-            None,
+            NavigationPayload {
+                history_target: None,
+                post_fields: None,
+            },
         );
     } else if form.method == "post" && form.enctype == "application/x-www-form-urlencoded" {
         begin_navigation_request(
@@ -1362,8 +1389,10 @@ fn begin_form_submission(
             sender,
             request_id,
             cancellations,
-            None,
-            Some(fields),
+            NavigationPayload {
+                history_target: None,
+                post_fields: Some(fields),
+            },
         );
     } else {
         state.status = format!(
@@ -1396,20 +1425,16 @@ fn interactive_targets(page: &TuiPage) -> Vec<InteractiveTarget> {
             ComponentKind::Link {
                 text,
                 target,
-                interactive_id,
-            } => {
-                if let Some(id) = interactive_id {
-                    out.push(InteractiveTarget {
-                        id: id.clone(),
-                        label: text.clone(),
-                        target: target.clone(),
-                        is_button: false,
-                        disabled: false,
-                        form_control: None,
-                        form: None,
-                    });
-                }
-            }
+                interactive_id: Some(id),
+            } => out.push(InteractiveTarget {
+                id: id.clone(),
+                label: text.clone(),
+                target: target.clone(),
+                is_button: false,
+                disabled: false,
+                form_control: None,
+                form: None,
+            }),
             ComponentKind::Input {
                 interactive_id,
                 label,
@@ -2183,6 +2208,29 @@ mod tests {
             UiAction::None
         );
         assert!(ui.dialog.is_none());
+    }
+
+    #[test]
+    fn get_forms_with_password_fields_are_blocked_before_network_or_history() {
+        let mut ui = form_state(
+            r#"<form action="/login" method="get"><input name="user"><input name="password" type="password"><button type="submit">Login</button></form>"#,
+        );
+        let form_id = ui.tab().page.forms[0].id.clone();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut request_id = 0;
+        let mut cancellations = HashMap::new();
+        super::begin_form_submission(
+            &mut ui,
+            &form_id,
+            None,
+            HttpClient::default(),
+            &sender,
+            &mut request_id,
+            &mut cancellations,
+        );
+        assert!(ui.status.contains("GET form with a password field blocked"));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(request_id, 0);
     }
 
     #[test]

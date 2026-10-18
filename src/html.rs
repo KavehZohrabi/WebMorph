@@ -92,10 +92,10 @@ fn walk_children(
                     children: vec![],
                 });
             }
-        } else if let Some(element) = ElementRef::wrap(child) {
-            if let Some(node) = parse_element(element, base, document, ordinal) {
-                out.push(node);
-            }
+        } else if let Some(element) = ElementRef::wrap(child)
+            && let Some(node) = parse_element(element, base, document, ordinal)
+        {
+            out.push(node);
         }
     }
     out

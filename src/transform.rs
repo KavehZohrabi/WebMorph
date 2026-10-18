@@ -736,7 +736,7 @@ fn truncate_line(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let ellipsis = if width == 1 { "…" } else { "…" };
+    let ellipsis = "…";
     let available = width.saturating_sub(display_width(ellipsis));
     let mut out = String::new();
     let mut used = 0;

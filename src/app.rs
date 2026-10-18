@@ -44,9 +44,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     };
     let mut terminal = TerminalSession::new()?;
-    let mut http_config = HttpConfig::default();
-    http_config.request_timeout = std::time::Duration::from_secs(settings.request_timeout_seconds);
-    http_config.user_agent = settings.user_agent;
+    let http_config = HttpConfig {
+        request_timeout: std::time::Duration::from_secs(settings.request_timeout_seconds),
+        user_agent: settings.user_agent,
+        ..HttpConfig::default()
+    };
     terminal
         .run_url(
             input.to_owned(),
