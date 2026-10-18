@@ -1,10 +1,7 @@
 use clap::CommandFactory;
-use tracing::{error, info};
+use tracing::info;
 
-use crate::{
-    cli::Cli, error::Result, html, network::HttpClient, plugins::PluginRegistry, transform,
-    tui::TerminalSession,
-};
+use crate::{cli::Cli, error::Result, network::HttpClient, tui::TerminalSession};
 
 pub async fn run(cli: Cli) -> Result<()> {
     let Some(input) = cli.url.as_deref() else {
@@ -12,25 +9,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         println!();
         return Ok(());
     };
-    let url = HttpClient::parse_url(input)?;
-    info!(%url, "opening website");
-    let client = HttpClient::default();
-    let source = tokio::select! {
-        result = client.get_text(&url) => result.map_err(|error| {
-            error!(%url, %error, "could not fetch website");
-            error
-        })?,
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            info!("shutdown requested");
-            return Ok(());
-        }
-    };
-    let mut document = html::parse(url.as_str(), &source);
-    PluginRegistry::default().process(&mut document);
-    let page = transform::transform(&document);
+    info!(%input, "opening website");
     let mut terminal = TerminalSession::new()?;
-    terminal.run(&page).await
+    terminal
+        .run_url(input.to_owned(), HttpClient::default())
+        .await
 }
 
 #[cfg(test)]
