@@ -1,5 +1,7 @@
 use std::{
+    collections::HashMap,
     io::{self, Stdout},
+    process::Command,
     time::Duration,
 };
 
@@ -65,6 +67,8 @@ struct BrowserTab {
     scroll: usize,
     history: Vec<String>,
     history_index: usize,
+    selected_interactive: usize,
+    request_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,11 +85,16 @@ enum UiAction {
     None,
     Quit,
     Navigate(String),
+    NavigateNewTab(String),
+    OpenExternal(String),
     Back,
     Forward,
     Reload,
+    Home,
     NewTab,
     CloseTab,
+    NextTab,
+    PreviousTab,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +134,8 @@ impl UiState {
                 vec![address.clone()]
             },
             history_index: 0,
+            selected_interactive: 0,
+            request_id: 0,
         };
         Self {
             tabs: vec![tab],
@@ -169,6 +180,13 @@ impl UiState {
         if ctrl && matches!(key.code, KeyCode::Char('w' | 'W')) {
             return UiAction::CloseTab;
         }
+        if ctrl && key.code == KeyCode::Tab {
+            return if shift {
+                UiAction::PreviousTab
+            } else {
+                UiAction::NextTab
+            };
+        }
         if self.dialog.is_some() {
             if matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?')) {
                 self.dialog = None;
@@ -199,7 +217,8 @@ impl UiState {
             return self.address_key(key);
         }
         match key.code {
-            KeyCode::Enter => self.activate(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.external_target(),
+            KeyCode::Enter => self.activate(shift),
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.focus == Focus::Tabs {
                     self.select_tab(-1);
@@ -250,6 +269,7 @@ impl UiState {
             }
             KeyCode::Char('q' | 'Q') => UiAction::Quit,
             KeyCode::Char('r' | 'R') => UiAction::Reload,
+            KeyCode::Char('h' | 'H') => UiAction::Home,
             KeyCode::Char('[') => UiAction::Back,
             KeyCode::Char(']') => UiAction::Forward,
             _ => UiAction::None,
@@ -301,7 +321,7 @@ impl UiState {
         UiAction::None
     }
 
-    fn activate(&mut self) -> UiAction {
+    fn activate(&mut self, open_new_tab: bool) -> UiAction {
         if self.focus == Focus::Help {
             self.dialog = Some(Dialog::Help);
             self.dirty = true;
@@ -325,7 +345,11 @@ impl UiState {
         if let Some(url) = &target.target {
             self.address = url.clone();
             self.address_cursor = self.address.chars().count();
-            UiAction::Navigate(url.clone())
+            if open_new_tab {
+                UiAction::NavigateNewTab(url.clone())
+            } else {
+                UiAction::Navigate(url.clone())
+            }
         } else {
             self.status = if target.is_button {
                 format!(
@@ -336,6 +360,24 @@ impl UiState {
                 format!("Selected {}", target.label)
             };
             self.dirty = true;
+            UiAction::None
+        }
+    }
+
+    fn external_target(&mut self) -> UiAction {
+        if self.focus != Focus::Content {
+            return UiAction::None;
+        }
+        let targets = interactive_targets(&self.tab().page.root);
+        let Some(target) = targets.get(self.selected_interactive) else {
+            return UiAction::None;
+        };
+        if target.disabled {
+            return UiAction::None;
+        }
+        if let Some(url) = &target.target {
+            UiAction::OpenExternal(url.clone())
+        } else {
             UiAction::None
         }
     }
@@ -373,11 +415,45 @@ impl UiState {
     }
 
     fn select_tab(&mut self, delta: isize) {
+        self.tab_mut().selected_interactive = self.selected_interactive;
         self.active_tab =
             (self.active_tab as isize + delta).rem_euclid(self.tabs.len() as isize) as usize;
         self.address = self.tab().url.clone();
         self.address_cursor = self.address.chars().count();
+        self.selected_interactive = self.tab().selected_interactive;
+        self.focus = Focus::Tabs;
+        self.dirty = true;
+    }
+
+    fn append_new_tab(&mut self, url: String) {
+        let page = transform(&Document::new(url.clone(), "New tab"));
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(BrowserTab {
+            id,
+            title: "New tab".into(),
+            url: String::new(),
+            page,
+            error: None,
+            loading: false,
+            scroll: 0,
+            history: vec![],
+            history_index: 0,
+            selected_interactive: 0,
+            request_id: 0,
+        });
+        self.active_tab = self.tabs.len() - 1;
+        self.address.clear();
+        self.address_cursor = 0;
+        self.address_replacing = false;
         self.selected_interactive = 0;
+        self.focus = Focus::Address;
+        self.dirty = true;
+        if !url.is_empty() {
+            self.address = url.clone();
+            self.address_cursor = url.chars().count();
+            self.address_replacing = true;
+        }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> UiAction {
@@ -457,7 +533,7 @@ impl UiState {
                                     return UiAction::Navigate(url.clone());
                                 }
                                 if target.is_button {
-                                    return self.activate();
+                                    return self.activate(false);
                                 }
                             }
                         }
@@ -474,9 +550,8 @@ impl UiState {
 struct NavigationResult {
     request_id: u64,
     tab_id: u64,
-    url: String,
     history_target: Option<usize>,
-    result: std::result::Result<TuiPage, WebMorphError>,
+    result: std::result::Result<(TuiPage, String), WebMorphError>,
 }
 
 pub struct TerminalSession {
@@ -535,7 +610,7 @@ impl TerminalSession {
     ) -> Result<()> {
         let (sender, mut receiver) = mpsc::unbounded_channel::<NavigationResult>();
         let mut request_id = 0u64;
-        let mut cancellation: Option<CancellationToken> = None;
+        let mut cancellations: HashMap<u64, CancellationToken> = HashMap::new();
         if let Some((url, client)) = initial {
             begin_navigation(
                 &mut state,
@@ -543,7 +618,7 @@ impl TerminalSession {
                 client,
                 &sender,
                 &mut request_id,
-                &mut cancellation,
+                &mut cancellations,
             );
         }
         let mut ticker = tokio::time::interval(TICK);
@@ -557,28 +632,29 @@ impl TerminalSession {
             tokio::select! {
                 signal = &mut shutdown => { signal?; break; }
                 Some(result) = receiver.recv() => {
-                    if result.request_id == request_id {
-                        if let Some(index) = state.tabs.iter().position(|tab| tab.id == result.tab_id) {
+                    if let Some(index) = state.tabs.iter().position(|tab| tab.id == result.tab_id && tab.request_id == result.request_id) {
+                            cancellations.remove(&result.tab_id);
                             let is_active = index == state.active_tab;
                             let tab = &mut state.tabs[index]; tab.loading = false; tab.error = None;
                             let status = match result.result {
-                                Ok(page) => {
-                                    tab.title = page.title.clone(); tab.url = result.url.clone(); tab.page = page; tab.scroll = 0;
-                                    if let Some(index) = result.history_target { tab.history_index = index; }
-                                    else { tab.history.truncate(tab.history_index.saturating_add(1)); if tab.history.last() != Some(&result.url) { tab.history.push(result.url.clone()); } tab.history_index = tab.history.len().saturating_sub(1); }
+                                Ok((page, final_url)) => {
+                                    tab.title = page.title.clone(); tab.url = final_url.clone(); tab.page = page; tab.scroll = 0;
+                                    tab.selected_interactive = 0;
+                                    if let Some(index) = result.history_target { tab.history_index = index; tab.history[index] = final_url.clone(); }
+                                    else { tab.history.truncate(tab.history_index.saturating_add(1)); if tab.history.last() != Some(&final_url) { tab.history.push(final_url.clone()); } tab.history_index = tab.history.len().saturating_sub(1); }
                                     "Page loaded"
                                 }
                                 Err(WebMorphError::Cancelled) => "Request cancelled",
                                 Err(error) => { tab.error = Some(error.to_string()); "Unable to load page" }
                             };
                             if is_active {
-                                state.address = result.url;
+                                if let Some(tab) = state.tabs.iter().find(|tab| tab.id == result.tab_id) { state.address = tab.url.clone(); }
+                                if status == "Page loaded" { state.selected_interactive = 0; }
                                 state.status = status.into();
                                 state.focus = if status == "Unable to load page" { Focus::Address } else { Focus::Content };
                                 state.address_replacing = status == "Unable to load page";
                             }
-                            cancellation = None; state.dirty = true;
-                        }
+                            state.dirty = true;
                     }
                 }
                 _ = ticker.tick() => {
@@ -589,13 +665,18 @@ impl TerminalSession {
                                 let action = state.handle_key(key);
                                 match action {
                                     UiAction::Quit => break,
-                                    UiAction::Navigate(url) if url.is_empty() => { if let Some(token) = cancellation.take() { token.cancel(); } state.tab_mut().loading = false; state.status = "Request cancelled".into(); state.dirty = true; }
-                                    UiAction::Navigate(url) => begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellation),
-                                    UiAction::Reload => { let url = state.tab().url.clone(); begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellation); }
-                                    UiAction::Back => { if state.tab().history_index > 0 { let target = state.tab().history_index - 1; let url = state.tab().history[target].clone(); begin_navigation_target(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellation, Some(target)); } }
-                                    UiAction::Forward => { if state.tab().history_index + 1 < state.tab().history.len() { let target = state.tab().history_index + 1; let url = state.tab().history[target].clone(); begin_navigation_target(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellation, Some(target)); } }
-                                    UiAction::NewTab => { let page = transform(&Document::new("", "New tab")); let id = state.next_tab_id; state.next_tab_id += 1; state.tabs.push(BrowserTab { id, title: "New tab".into(), url: String::new(), page, error: None, loading: false, scroll: 0, history: vec![], history_index: 0 }); state.active_tab = state.tabs.len()-1; state.address.clear(); state.address_cursor = 0; state.address_replacing = false; state.focus = Focus::Address; state.dirty = true; }
-                                    UiAction::CloseTab => { if state.tabs.len() > 1 { state.tabs.remove(state.active_tab); state.active_tab = state.active_tab.min(state.tabs.len()-1); state.address = state.tab().url.clone(); state.dirty = true; } else { break; } }
+                                    UiAction::Navigate(url) if url.is_empty() => { if let Some(token) = cancellations.remove(&state.tab().id) { token.cancel(); } state.tab_mut().loading = false; state.status = "Request cancelled".into(); state.dirty = true; }
+                                    UiAction::Navigate(url) => begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations),
+                                    UiAction::NavigateNewTab(url) => { state.append_new_tab(url.clone()); begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations); }
+                                    UiAction::OpenExternal(url) => { state.status = match open_external(&url) { Ok(()) => "Opened link in system browser".into(), Err(error) => format!("Could not open external link: {error}") }; state.dirty = true; }
+                                    UiAction::Reload => { let url = state.tab().url.clone(); begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations); }
+                                    UiAction::Home => { if let Ok(mut url) = HttpClient::parse_url(&state.tab().url) { url.set_path("/"); url.set_query(None); url.set_fragment(None); begin_navigation(&mut state, url.to_string(), HttpClient::default(), &sender, &mut request_id, &mut cancellations); } }
+                                    UiAction::Back => { if state.tab().history_index > 0 { let target = state.tab().history_index - 1; let url = state.tab().history[target].clone(); begin_navigation_target(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations, Some(target)); } }
+                                    UiAction::Forward => { if state.tab().history_index + 1 < state.tab().history.len() { let target = state.tab().history_index + 1; let url = state.tab().history[target].clone(); begin_navigation_target(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations, Some(target)); } }
+                                    UiAction::NewTab => { state.append_new_tab(String::new()); }
+                                    UiAction::NextTab => state.select_tab(1),
+                                    UiAction::PreviousTab => state.select_tab(-1),
+                                    UiAction::CloseTab => { if state.tabs.len() > 1 { let removed = state.tabs.remove(state.active_tab); if let Some(token) = cancellations.remove(&removed.id) { token.cancel(); } state.active_tab = state.active_tab.min(state.tabs.len()-1); state.address = state.tab().url.clone(); state.selected_interactive = state.tab().selected_interactive; state.dirty = true; } else { break; } }
                                     UiAction::None => {}
                                 }
                             }
@@ -604,22 +685,27 @@ impl TerminalSession {
                                 let area = Rect::new(0, 0, size.width, size.height);
                                 let action = state.handle_mouse(mouse, area);
                                 match action {
-                                    UiAction::Navigate(url) => begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellation),
+                                    UiAction::Navigate(url) => begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations),
+                                    UiAction::NavigateNewTab(url) => { state.append_new_tab(url.clone()); begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations); }
+                                    UiAction::OpenExternal(url) => { state.status = match open_external(&url) { Ok(()) => "Opened link in system browser".into(), Err(error) => format!("Could not open external link: {error}") }; state.dirty = true; }
                                     UiAction::Back => {
                                         if state.tab().history_index > 0 {
                                             let target = state.tab().history_index - 1;
                                             let url = state.tab().history[target].clone();
-                                            begin_navigation_target(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellation, Some(target));
+                                            begin_navigation_target(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations, Some(target));
                                         }
                                     }
                                     UiAction::Forward => {
                                         if state.tab().history_index + 1 < state.tab().history.len() {
                                             let target = state.tab().history_index + 1;
                                             let url = state.tab().history[target].clone();
-                                            begin_navigation_target(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellation, Some(target));
+                                            begin_navigation_target(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations, Some(target));
                                         }
                                     }
-                                    UiAction::Reload => { let url = state.tab().url.clone(); begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellation); }
+                                    UiAction::Reload => { let url = state.tab().url.clone(); begin_navigation(&mut state, url, HttpClient::default(), &sender, &mut request_id, &mut cancellations); }
+                                    UiAction::Home => { if let Ok(mut url) = HttpClient::parse_url(&state.tab().url) { url.set_path("/"); url.set_query(None); url.set_fragment(None); begin_navigation(&mut state, url.to_string(), HttpClient::default(), &sender, &mut request_id, &mut cancellations); } }
+                                    UiAction::NextTab => state.select_tab(1),
+                                    UiAction::PreviousTab => state.select_tab(-1),
                                     _ => {}
                                 }
                                 state.dirty = true;
@@ -631,7 +717,7 @@ impl TerminalSession {
                 }
             }
         }
-        if let Some(token) = cancellation {
+        for token in cancellations.into_values() {
             token.cancel();
         }
         Ok(())
@@ -708,13 +794,13 @@ impl TerminalSession {
                 frame.render_widget(Paragraph::new(label).style(if state.tab().error.is_some() { theme.error } else { theme.status }), status_area);
             }
             if help_area.height > 0 {
-                let help = match state.focus { Focus::Address => "Enter: open   Esc: leave address   Ctrl+L: focus address   Ctrl+Q: quit", Focus::Tabs => "←/→ or ↑/↓: switch tabs   Tab: content   Ctrl+T: new tab   Ctrl+W: close", Focus::Content => "Tab: next control   Enter: activate   ↑/↓: scroll   Ctrl+L: address   ?: help   Ctrl+Q: quit", Focus::Help => "Enter: help   Esc: close   Ctrl+Q: quit" };
+                let help = match state.focus { Focus::Address => "Enter: open   Esc: leave address   Ctrl+L: focus address   Ctrl+Q: quit", Focus::Tabs => "←/→ or ↑/↓: switch tabs   Ctrl+Tab: cycle   Ctrl+T: new tab   Ctrl+W: close", Focus::Content => "Tab: next control   Enter: open   Shift+Enter: new tab   Alt+Enter: system browser   Ctrl+L: address", Focus::Help => "Enter: help   Esc: close   Ctrl+Q: quit" };
                 frame.render_widget(Paragraph::new(if self.ascii { to_ascii(help) } else { help.into() }).style(theme.muted), help_area);
             }
             if state.dialog == Some(Dialog::Help) {
                 let width = area.width.min(76).max(24); let height = area.height.min(15).max(7);
                 let popup = centered(area, width, height);
-                let help = vec![Line::styled("Keyboard and mouse", theme.accent.add_modifier(Modifier::BOLD)), Line::raw(""), Line::raw("Tab / Shift+Tab  Move focus between address, tabs, content, help"), Line::raw("Arrow keys      Scroll content or move across tabs"), Line::raw("Enter           Open address or activate selected link/control"), Line::raw("Ctrl+L          Focus the address bar"), Line::raw("Ctrl+T / Ctrl+W New tab / close tab"), Line::raw("[ / ]           Back / forward; r reloads"), Line::raw("Ctrl+Q          Quit"), Line::raw("Mouse           Click links and controls; wheel to scroll"), Line::raw("t               Cycle Auto, Dark, and Light themes"), Line::raw(""), Line::styled("Esc: close this panel", theme.muted)];
+                let help = vec![Line::styled("Keyboard and mouse", theme.accent.add_modifier(Modifier::BOLD)), Line::raw(""), Line::raw("Tab / Shift+Tab  Move focus between address, tabs, content, help"), Line::raw("Arrow keys      Scroll content or move across tabs"), Line::raw("Enter           Open address or selected link"), Line::raw("Shift+Enter     Open selected link in a new tab"), Line::raw("Alt+Enter       Open selected link in system browser"), Line::raw("Ctrl+L          Focus the address bar"), Line::raw("Ctrl+T / Ctrl+W New tab / close tab"), Line::raw("Ctrl+Tab        Next tab; Ctrl+Shift+Tab previous tab"), Line::raw("h               Home (site root)"), Line::raw("[ / ]           Back / forward; r reloads"), Line::raw("Ctrl+Q          Quit"), Line::raw("Mouse           Click links and controls; wheel to scroll"), Line::raw("t               Cycle Auto, Dark, and Light themes"), Line::raw(""), Line::styled("Esc: close this panel", theme.muted)];
                 frame.render_widget(Clear, popup);
                 frame.render_widget(Paragraph::new(Text::from(help)).block(Block::default().title(" Help ").borders(Borders::ALL).border_style(theme.accent).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), popup);
             }
@@ -729,9 +815,9 @@ fn begin_navigation(
     client: HttpClient,
     sender: &mpsc::UnboundedSender<NavigationResult>,
     request_id: &mut u64,
-    cancellation: &mut Option<CancellationToken>,
+    cancellations: &mut HashMap<u64, CancellationToken>,
 ) {
-    begin_navigation_target(state, url, client, sender, request_id, cancellation, None)
+    begin_navigation_target(state, url, client, sender, request_id, cancellations, None)
 }
 
 fn begin_navigation_target(
@@ -740,26 +826,39 @@ fn begin_navigation_target(
     client: HttpClient,
     sender: &mpsc::UnboundedSender<NavigationResult>,
     request_id: &mut u64,
-    cancellation: &mut Option<CancellationToken>,
+    cancellations: &mut HashMap<u64, CancellationToken>,
     history_target: Option<usize>,
 ) {
-    if url.is_empty() {
+    if url.trim().is_empty() {
         state.status = "Enter an HTTP or HTTPS address".into();
         state.dirty = true;
         return;
     }
-    if let Some(token) = cancellation.take() {
+    let tab_id = state.tab().id;
+    if state.tab().loading && state.tab().url == url.trim() {
+        return;
+    }
+    if let Some(token) = cancellations.remove(&tab_id) {
         token.cancel();
-        for tab in &mut state.tabs {
-            tab.loading = false;
-        }
     }
     *request_id = request_id.wrapping_add(1);
     let id = *request_id;
+    let parsed_url = match normalize_address(url.trim()) {
+        Ok(url) => url,
+        Err(error) => {
+            let tab = state.tab_mut();
+            tab.request_id = id;
+            tab.loading = false;
+            tab.error = Some(error.to_string());
+            state.status = "Invalid address".into();
+            state.dirty = true;
+            return;
+        }
+    };
+    let url = parsed_url.to_string();
     let token = CancellationToken::new();
-    *cancellation = Some(token.clone());
-    let tab_id = state.tab().id;
     let tab = state.tab_mut();
+    tab.request_id = id;
     tab.url = url.clone();
     tab.loading = true;
     tab.error = None;
@@ -769,23 +868,53 @@ fn begin_navigation_target(
     state.status = "Loading page".into();
     state.dirty = true;
     let tx = sender.clone();
+    cancellations.insert(tab_id, token.clone());
     tokio::spawn(async move {
         let result = async {
             let parsed = HttpClient::parse_url(&url)?;
-            let source = client.get_text_cancellable(&parsed, token).await?;
-            let mut document = html::parse(parsed.as_str(), &source);
+            let (final_url, source) = client
+                .get_text_with_final_url_cancellable(&parsed, token)
+                .await?;
+            let mut document = html::parse(final_url.as_str(), &source);
             PluginRegistry::default().process(&mut document);
-            Ok(transform(&document))
+            Ok((transform(&document), final_url.to_string()))
         }
         .await;
         let _ = tx.send(NavigationResult {
             request_id: id,
             tab_id,
-            url,
             history_target,
             result,
         });
     });
+}
+
+fn normalize_address(input: &str) -> Result<String> {
+    let has_scheme = input
+        .split(['/', '?', '#'])
+        .next()
+        .is_some_and(|prefix| prefix.contains(':'));
+    let candidate = if has_scheme {
+        input.to_owned()
+    } else {
+        format!("https://{input}")
+    };
+    HttpClient::parse_url(&candidate).map(|url| url.to_string())
+}
+
+fn open_external(url: &str) -> std::io::Result<()> {
+    let parsed = HttpClient::parse_url(url)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = Command::new("rundll32");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    #[cfg(target_os = "windows")]
+    command.arg("url.dll,FileProtocolHandler");
+    command.arg(parsed.as_str());
+    command.spawn().map(|_| ())
 }
 
 fn interactive_targets(root: &crate::transform::Component) -> Vec<InteractiveTarget> {
@@ -1033,7 +1162,7 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{Focus, Theme, UiAction, UiState};
+    use super::{CancellationToken, Focus, HashMap, HttpClient, Theme, UiAction, UiState, mpsc};
     use crate::{dom::Document, html, transform::transform};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1142,6 +1271,91 @@ mod tests {
         assert_eq!(ui.theme, Theme::Dark);
         ui.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert_eq!(ui.theme, Theme::Light);
+    }
+
+    #[test]
+    fn ctrl_tab_switches_tabs_and_preserves_each_tabs_selection() {
+        let mut ui = state();
+        ui.append_new_tab(String::new());
+        assert_eq!(ui.tabs.len(), 2);
+        ui.focus = Focus::Content;
+        ui.selected_interactive = 1;
+        assert_eq!(
+            ui.handle_key(KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            UiAction::PreviousTab
+        );
+        ui.select_tab(-1);
+        assert_eq!(ui.active_tab, 0);
+        assert_eq!(ui.focus, Focus::Tabs);
+        assert_eq!(ui.selected_interactive, 0);
+        assert_eq!(
+            ui.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            UiAction::NextTab
+        );
+        ui.select_tab(1);
+        assert_eq!(ui.active_tab, 1);
+        assert_eq!(ui.selected_interactive, 1);
+    }
+
+    #[test]
+    fn shift_enter_opens_selected_link_in_new_tab() {
+        let mut ui = state();
+        ui.focus = Focus::Content;
+        assert_eq!(
+            ui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            UiAction::NavigateNewTab("https://example.com/home".into())
+        );
+    }
+
+    #[test]
+    fn alt_enter_is_an_explicit_external_open_action() {
+        let mut ui = state();
+        ui.focus = Focus::Content;
+        assert_eq!(
+            ui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            UiAction::OpenExternal("https://example.com/home".into())
+        );
+    }
+
+    #[test]
+    fn address_normalization_adds_https_and_rejects_unsafe_schemes() {
+        assert_eq!(
+            super::normalize_address("example.org/path").unwrap(),
+            "https://example.org/path"
+        );
+        assert!(super::normalize_address("javascript:alert(1)").is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_url_supersedes_pending_navigation_without_crashing() {
+        let mut ui = state();
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut cancellations = HashMap::new();
+        let mut request_id = 0;
+        let old = CancellationToken::new();
+        ui.tab_mut().loading = true;
+        ui.tab_mut().url = "https://example.com/old".into();
+        cancellations.insert(ui.tab().id, old.clone());
+        super::begin_navigation(
+            &mut ui,
+            "file:///etc/passwd".into(),
+            HttpClient::default(),
+            &sender,
+            &mut request_id,
+            &mut cancellations,
+        );
+        assert!(old.is_cancelled());
+        assert!(!ui.tab().loading);
+        assert!(
+            ui.tab()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("only http and https")
+        );
     }
 
     #[test]

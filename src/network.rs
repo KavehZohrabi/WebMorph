@@ -120,6 +120,16 @@ impl HttpClient {
         url: &Url,
         cancellation: CancellationToken,
     ) -> Result<String> {
+        self.get_text_with_final_url_cancellable(url, cancellation)
+            .await
+            .map(|(_, body)| body)
+    }
+
+    pub async fn get_text_with_final_url_cancellable(
+        &self,
+        url: &Url,
+        cancellation: CancellationToken,
+    ) -> Result<(Url, String)> {
         let url = Self::parse_url(url.as_str())?;
         self.check_destination(&url).await?;
         let _permit = tokio::select! {
@@ -132,6 +142,7 @@ impl HttpClient {
             result = self.client.get(url).header(ACCEPT, "text/html,application/xhtml+xml;q=0.9").send() => result.map_err(classify_reqwest)?,
         };
         self.validate_response(&response)?;
+        let final_url = response.url().clone();
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         loop {
@@ -152,9 +163,10 @@ impl HttpClient {
                 }
             }
         }
-        String::from_utf8(body).map_err(|_| {
+        let body = String::from_utf8(body).map_err(|_| {
             WebMorphError::UnsupportedContent("HTML response is not valid UTF-8".into())
-        })
+        })?;
+        Ok((final_url, body))
     }
 
     async fn check_destination(&self, url: &Url) -> Result<()> {
@@ -356,11 +368,15 @@ mod tests {
     #[tokio::test]
     async fn follows_same_host_redirects() {
         let url = serve_redirect().await;
-        let text = local_client()
-            .get_text(&HttpClient::parse_url(&url).unwrap())
+        let (final_url, text) = local_client()
+            .get_text_with_final_url_cancellable(
+                &HttpClient::parse_url(&url).unwrap(),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(text, "<p>redirected</p>");
+        assert!(final_url.path().ends_with("/final"));
     }
 
     #[tokio::test]
