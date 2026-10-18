@@ -106,6 +106,10 @@ pub struct TuiPage {
     pub layout: LayoutHints,
     pub lines: Vec<String>,
     pub forms: Vec<FormDefinition>,
+    /// Built-in plugin that adapted the page, if any.
+    pub plugin_name: Option<String>,
+    /// Safe navigation shortcuts contributed by the selected plugin.
+    pub plugin_navigation: Vec<crate::plugins::NavigationAction>,
 }
 
 /// Transform using a conventional 80-column viewport.
@@ -188,6 +192,8 @@ pub fn transform_for_width(document: &Document, width: usize) -> TuiPage {
         layout,
         lines,
         forms: document.forms.clone(),
+        plugin_name: None,
+        plugin_navigation: Vec::new(),
     }
 }
 

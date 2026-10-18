@@ -1209,8 +1209,10 @@ fn begin_navigation_request(
                     .await?
             };
             let mut document = html::parse(final_url.as_str(), &source);
-            PluginRegistry::default().process(&mut document);
-            Ok((transform(&document), final_url.to_string()))
+            let report = PluginRegistry::default().process(&mut document);
+            let mut page = transform(&document);
+            crate::plugins::apply_report_to_page(&mut page, report);
+            Ok((page, final_url.to_string()))
         }
         .await;
         let _ = tx.send(NavigationResult {
