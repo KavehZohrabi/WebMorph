@@ -15,7 +15,10 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::{error::Result, transform::TuiPage};
+use crate::{
+    error::Result,
+    transform::{TuiPage, layout_components},
+};
 
 pub struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -76,10 +79,9 @@ impl TerminalSession {
         self.terminal.draw(|frame| {
             let areas =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
-            let lines = page
-                .lines
-                .iter()
-                .map(|line| Line::raw(line.as_str()))
+            let lines = layout_components(&page.root, frame.area().width as usize)
+                .into_iter()
+                .map(Line::raw)
                 .collect::<Vec<_>>();
             let content = Paragraph::new(Text::from(lines))
                 .block(
