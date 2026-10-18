@@ -1,87 +1,452 @@
-use scraper::{Html, Selector};
+use reqwest::Url;
+use scraper::{ElementRef, Html, Selector};
 
-use crate::dom::{ContentBlock, Document};
+use crate::dom::{
+    ContentBlock, ContentKind, ContentNode, Document, InteractiveElement, InteractiveKind,
+};
+
+const IGNORED: &[&str] = &[
+    "script", "style", "noscript", "template", "head", "meta", "link", "title",
+];
 
 pub fn parse(url: &str, source: &str) -> Document {
     let html = Html::parse_document(source);
-    let title_selector = Selector::parse("title").expect("static selector");
-    let title = html
-        .select(&title_selector)
-        .next()
+    let title = select_first(&html, "title")
         .map(text_of)
-        .filter(|title| !title.is_empty())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| url.to_owned());
     let mut document = Document::new(url, title);
+    let document_url = Url::parse(url).ok();
+    let base = select_first(&html, "base[href]")
+        .and_then(|e| resolve(document_url.as_ref(), e.value().attr("href")))
+        .and_then(|s| Url::parse(&s).ok())
+        .or_else(|| document_url.clone());
+    document.metadata.base_url = base.as_ref().map(ToString::to_string);
+    document.metadata.language =
+        select_first(&html, "html[lang]").and_then(|e| e.value().attr("lang").map(str::to_owned));
+    document.metadata.description = select_first(&html, "meta[name='description']").and_then(|e| {
+        e.value()
+            .attr("content")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    });
 
-    let content_selector =
-        Selector::parse("h1, h2, h3, h4, h5, h6, p, a[href]").expect("static selector");
-    for element in html.select(&content_selector) {
-        let text = text_of(element);
-        if text.is_empty() {
-            continue;
-        }
-        match element.value().name() {
-            "h1" => document
-                .blocks
-                .push(ContentBlock::Heading { level: 1, text }),
-            "h2" => document
-                .blocks
-                .push(ContentBlock::Heading { level: 2, text }),
-            "h3" => document
-                .blocks
-                .push(ContentBlock::Heading { level: 3, text }),
-            "h4" => document
-                .blocks
-                .push(ContentBlock::Heading { level: 4, text }),
-            "h5" => document
-                .blocks
-                .push(ContentBlock::Heading { level: 5, text }),
-            "h6" => document
-                .blocks
-                .push(ContentBlock::Heading { level: 6, text }),
-            "p" => document.blocks.push(ContentBlock::Paragraph { text }),
-            "a" => {
-                let Some(href) = element.value().attr("href") else {
-                    continue;
-                };
-                document.blocks.push(ContentBlock::Link {
-                    text,
-                    href: href.to_owned(),
-                });
-            }
-            _ => {}
-        }
+    let mut ordinal = 0usize;
+    if let Some(body) = select_first(&html, "body") {
+        document.content = walk_children(body, base.as_ref(), &mut document, &mut ordinal);
+    } else if let Some(root) = select_first(&html, "html") {
+        document.content = walk_children(root, base.as_ref(), &mut document, &mut ordinal);
     }
+    // Keep the original flat API usable by the existing renderer and plugins.
+    collect_legacy_blocks(&document.content, &mut document.blocks);
     document
 }
 
-fn text_of(element: scraper::ElementRef<'_>) -> String {
-    element
-        .text()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+fn select_first<'a>(html: &'a Html, selector: &str) -> Option<ElementRef<'a>> {
+    Selector::parse(selector)
+        .ok()
+        .and_then(|s| html.select(&s).next())
+}
+
+fn walk_children(
+    parent: ElementRef<'_>,
+    base: Option<&Url>,
+    document: &mut Document,
+    ordinal: &mut usize,
+) -> Vec<ContentNode> {
+    let mut out = Vec::new();
+    for child in parent.children() {
+        if let Some(text) = child.value().as_text() {
+            let value = normalize(text);
+            if !value.is_empty() {
+                out.push(ContentNode {
+                    kind: ContentKind::Text { text: value },
+                    children: vec![],
+                });
+            }
+        } else if let Some(element) = ElementRef::wrap(child) {
+            if let Some(node) = parse_element(element, base, document, ordinal) {
+                out.push(node);
+            }
+        }
+    }
+    out
+}
+
+fn parse_element(
+    element: ElementRef<'_>,
+    base: Option<&Url>,
+    document: &mut Document,
+    ordinal: &mut usize,
+) -> Option<ContentNode> {
+    let tag = element.value().name();
+    if IGNORED.contains(&tag)
+        || element.value().attr("hidden").is_some()
+        || element.value().attr("aria-hidden") == Some("true")
+    {
+        return None;
+    }
+    let leaf = |kind| {
+        Some(ContentNode {
+            kind,
+            children: vec![],
+        })
+    };
+    match tag {
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => leaf(ContentKind::Heading {
+            level: tag[1..].parse().unwrap_or(1),
+            text: text_of(element),
+        }),
+        "p" => Some(ContentNode {
+            kind: ContentKind::Paragraph {
+                text: text_of(element),
+            },
+            children: walk_children(element, base, document, ordinal),
+        }),
+        "a" => {
+            let href = resolve(base, element.value().attr("href"));
+            let text = text_of(element);
+            let id = href.as_ref().map(|_| {
+                add_interactive(
+                    document,
+                    ordinal,
+                    InteractiveKind::Link,
+                    text.clone(),
+                    None,
+                    None,
+                    None,
+                    href.clone(),
+                    None,
+                    None,
+                    element.value().attr("aria-disabled") == Some("true"),
+                )
+            });
+            leaf(ContentKind::Link {
+                text,
+                href,
+                interactive_id: id,
+            })
+        }
+        "img" => {
+            let alt = element.value().attr("alt").unwrap_or("").trim().to_owned();
+            let src = resolve(base, element.value().attr("src"));
+            leaf(ContentKind::Image {
+                src,
+                alt,
+                interactive_id: None,
+            })
+        }
+        "ul" | "ol" => Some(ContentNode {
+            kind: ContentKind::List {
+                ordered: tag == "ol",
+            },
+            children: walk_children(element, base, document, ordinal),
+        }),
+        "li" => Some(ContentNode {
+            kind: ContentKind::ListItem {
+                text: text_of(element),
+            },
+            children: walk_children(element, base, document, ordinal),
+        }),
+        "table" => Some(ContentNode {
+            kind: ContentKind::Table,
+            children: walk_children(element, base, document, ordinal),
+        }),
+        "thead" | "tbody" | "tfoot" => Some(ContentNode {
+            kind: ContentKind::Text {
+                text: String::new(),
+            },
+            children: walk_children(element, base, document, ordinal),
+        }),
+        "tr" => Some(ContentNode {
+            kind: ContentKind::TableRow,
+            children: walk_children(element, base, document, ordinal),
+        }),
+        "th" | "td" => leaf(ContentKind::TableCell {
+            header: tag == "th",
+            text: text_of(element),
+        }),
+        "form" => Some(ContentNode {
+            kind: ContentKind::Form {
+                name: element.value().attr("name").map(str::to_owned),
+                action: resolve(base, element.value().attr("action")),
+                method: element
+                    .value()
+                    .attr("method")
+                    .unwrap_or("get")
+                    .to_ascii_lowercase(),
+            },
+            children: walk_children(element, base, document, ordinal),
+        }),
+        "input" | "textarea" | "select" => {
+            let input_type = if tag == "input" {
+                element.value().attr("type").unwrap_or("text")
+            } else {
+                tag
+            };
+            let label = element
+                .value()
+                .attr("aria-label")
+                .or_else(|| element.value().attr("placeholder"))
+                .or_else(|| element.value().attr("name"))
+                .unwrap_or("")
+                .to_owned();
+            let id = add_interactive(
+                document,
+                ordinal,
+                InteractiveKind::Input,
+                label,
+                element.value().attr("name").map(str::to_owned),
+                element.value().attr("value").map(str::to_owned),
+                Some(input_type.to_owned()),
+                None,
+                None,
+                element.value().attr("placeholder").map(str::to_owned),
+                element.value().attr("disabled").is_some(),
+            );
+            leaf(ContentKind::Input { interactive_id: id })
+        }
+        "button" => {
+            let text = text_of(element);
+            let label = if text.is_empty() {
+                element.value().attr("aria-label").unwrap_or("").to_owned()
+            } else {
+                text
+            };
+            let id = add_interactive(
+                document,
+                ordinal,
+                InteractiveKind::Button,
+                label,
+                element.value().attr("name").map(str::to_owned),
+                element.value().attr("value").map(str::to_owned),
+                Some(element.value().attr("type").unwrap_or("submit").to_owned()),
+                None,
+                None,
+                None,
+                element.value().attr("disabled").is_some(),
+            );
+            leaf(ContentKind::Button { interactive_id: id })
+        }
+        "nav" => Some(ContentNode {
+            kind: ContentKind::Navigation {
+                label: element.value().attr("aria-label").map(str::to_owned),
+            },
+            children: walk_children(element, base, document, ordinal),
+        }),
+        "iframe" | "canvas" | "video" | "audio" | "object" | "embed" => {
+            document.unsupported_elements.push(tag.to_owned());
+            leaf(ContentKind::Fallback {
+                tag: tag.to_owned(),
+                text: text_of(element),
+            })
+        }
+        "html" | "body" | "main" | "article" | "section" | "header" | "footer" | "aside"
+        | "div" | "span" | "strong" | "em" | "b" | "i" | "label" | "fieldset" | "legend"
+        | "option" | "datalist" | "details" | "summary" | "blockquote" | "figure"
+        | "figcaption" | "br" | "hr" => {
+            let children = walk_children(element, base, document, ordinal);
+            if children.is_empty() {
+                None
+            } else {
+                Some(ContentNode {
+                    kind: ContentKind::Text {
+                        text: String::new(),
+                    },
+                    children,
+                })
+            }
+        }
+        _ => {
+            if tag.contains('-') {
+                document.unsupported_elements.push(tag.to_owned());
+                leaf(ContentKind::Fallback {
+                    tag: tag.to_owned(),
+                    text: text_of(element),
+                })
+            } else {
+                walk_children(element, base, document, ordinal)
+                    .into_iter()
+                    .next()
+                    .map(|node| node)
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_interactive(
+    document: &mut Document,
+    ordinal: &mut usize,
+    kind: InteractiveKind,
+    label: String,
+    name: Option<String>,
+    value: Option<String>,
+    input_type: Option<String>,
+    href: Option<String>,
+    form_action: Option<String>,
+    placeholder: Option<String>,
+    disabled: bool,
+) -> String {
+    *ordinal += 1;
+    let id = format!("wm-{:04}", *ordinal);
+    document.interactive.push(InteractiveElement {
+        id: id.clone(),
+        kind,
+        label,
+        name,
+        value,
+        input_type,
+        href,
+        form_action,
+        placeholder,
+        disabled,
+    });
+    id
+}
+
+fn collect_legacy_blocks(nodes: &[ContentNode], out: &mut Vec<ContentBlock>) {
+    for node in nodes {
+        match &node.kind {
+            ContentKind::Heading { level, text } => out.push(ContentBlock::Heading {
+                level: *level,
+                text: text.clone(),
+            }),
+            ContentKind::Paragraph { text } => {
+                out.push(ContentBlock::Paragraph { text: text.clone() })
+            }
+            ContentKind::Link {
+                text,
+                href: Some(href),
+                ..
+            } if !text.is_empty() => out.push(ContentBlock::Link {
+                text: text.clone(),
+                href: href.clone(),
+            }),
+            _ => {}
+        }
+        collect_legacy_blocks(&node.children, out);
+    }
+}
+
+fn resolve(base: Option<&Url>, value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || value.starts_with("javascript:") || value.starts_with("data:") {
+        return None;
+    }
+    let base = base?;
+    base.join(value)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.to_string())
+}
+
+fn text_of(element: ElementRef<'_>) -> String {
+    normalize_iter(element.text())
+}
+fn normalize(value: &str) -> String {
+    normalize_iter(std::iter::once(value))
+}
+fn normalize_iter<'a>(parts: impl Iterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for part in parts {
+        for word in part.split_whitespace() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::dom::ContentBlock;
-
     use super::parse;
+    use crate::dom::ContentKind;
+
+    fn gather<'a>(nodes: &'a [crate::dom::ContentNode], kinds: &mut Vec<&'a ContentKind>) {
+        for node in nodes {
+            kinds.push(&node.kind);
+            gather(&node.children, kinds);
+        }
+    }
 
     #[test]
-    fn extracts_page_content() {
-        let document = parse(
-            "https://example.com",
-            "<title>Demo</title><h1>Hello</h1><p>Readable text</p><a href='/next'>Next</a>",
+    fn parses_simple_page_and_relative_links() {
+        let doc = parse(
+            "https://example.com/a/page",
+            "<title>Demo</title><h1>Hello</h1><p>Readable text <a href='/next'>Next</a></p>",
         );
-        assert_eq!(document.title, "Demo");
-        assert_eq!(document.blocks.len(), 3);
+        assert_eq!(doc.title, "Demo");
+        assert_eq!(doc.blocks.len(), 3);
+        assert!(doc.blocks.iter().any(|b| matches!(b, crate::dom::ContentBlock::Link { href, .. } if href == "https://example.com/next")));
+        assert_eq!(doc.interactive[0].id, "wm-0001");
+    }
+
+    #[test]
+    fn extracts_nested_structures_controls_navigation_and_metadata() {
+        let doc = parse(
+            "https://example.com/path",
+            "<html lang='en'><head><title>Page</title><meta name='description' content='Info'><base href='/root/'></head><body><nav aria-label='Primary'><ul><li><a href='home'>Home</a></li></ul></nav><form action='submit'><label>Name<input name='q' placeholder='Your name'></label><button>Go</button></form><img src='photo.png' alt='Portrait'></body></html>",
+        );
+        assert_eq!(doc.metadata.language.as_deref(), Some("en"));
+        assert_eq!(doc.metadata.description.as_deref(), Some("Info"));
+        let mut kinds = Vec::new();
+        gather(&doc.content, &mut kinds);
         assert!(
-            matches!(&document.blocks[0], ContentBlock::Heading { level: 1, text } if text == "Hello")
+            kinds
+                .iter()
+                .any(|k| matches!(k, ContentKind::Navigation { .. }))
         );
-        assert!(matches!(&document.blocks[2], ContentBlock::Link { href, .. } if href == "/next"));
+        assert!(kinds.iter().any(|k| matches!(k, ContentKind::List { .. })));
+        assert!(kinds.iter().any(|k| matches!(k, ContentKind::Form { action: Some(action), .. } if action == "https://example.com/root/submit")));
+        assert!(kinds.iter().any(|k| matches!(k, ContentKind::Image { alt, src: Some(src), .. } if alt == "Portrait" && src == "https://example.com/root/photo.png")));
+        assert_eq!(doc.interactive.len(), 3);
+        assert!(doc.interactive.iter().all(|i| i.id.starts_with("wm-")));
+    }
+
+    #[test]
+    fn parses_tables_and_handles_broken_or_empty_html() {
+        let doc = parse(
+            "https://example.com",
+            "<table><tr><th>A<td>B<tr><td>C<td>D</table><p><b>broken<p>later",
+        );
+        let mut kinds = Vec::new();
+        gather(&doc.content, &mut kinds);
+        assert!(kinds.iter().any(|k| matches!(k, ContentKind::Table)));
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, ContentKind::TableCell { header: true, .. }))
+        );
+        assert!(doc.blocks.len() >= 2);
+        let empty = parse("https://example.com/empty", "");
+        assert_eq!(empty.title, "https://example.com/empty");
+        assert!(empty.content.is_empty());
+    }
+
+    #[test]
+    fn handles_large_documents_without_losing_content() {
+        let mut source = String::from("<main>");
+        for n in 0..3000 {
+            source.push_str(&format!("<p>paragraph {n}</p>"));
+        }
+        source.push_str("</main>");
+        let doc = parse("https://example.com", &source);
+        assert_eq!(doc.blocks.len(), 3000);
+        assert_eq!(doc.content.len(), 1);
+    }
+
+    #[test]
+    fn ignores_scripts_styles_and_falls_back_for_unsupported_elements() {
+        let doc = parse(
+            "https://example.com",
+            "<script>secret()</script><style>.x{}</style><canvas>canvas fallback</canvas><x-widget>widget text</x-widget>",
+        );
+        assert_eq!(doc.unsupported_elements, vec!["canvas", "x-widget"]);
+        assert!(doc.blocks.is_empty());
+        assert!(!format!("{:?}", doc.content).contains("secret"));
     }
 }

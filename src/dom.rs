@@ -4,7 +4,110 @@ use serde::{Deserialize, Serialize};
 pub struct Document {
     pub url: String,
     pub title: String,
+    #[serde(default)]
+    pub metadata: PageMetadata,
+    /// Hierarchical normalized content used by non-terminal renderers.
+    #[serde(default)]
+    pub content: Vec<ContentNode>,
+    /// Stable, document-scoped controls and destinations.
+    #[serde(default)]
+    pub interactive: Vec<InteractiveElement>,
+    #[serde(default)]
+    pub unsupported_elements: Vec<String>,
+    /// Flat compatibility view consumed by the current terminal renderer.
+    #[serde(default)]
     pub blocks: Vec<ContentBlock>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageMetadata {
+    pub base_url: Option<String>,
+    pub language: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentNode {
+    pub kind: ContentKind,
+    #[serde(default)]
+    pub children: Vec<ContentNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentKind {
+    Heading {
+        level: u8,
+        text: String,
+    },
+    Paragraph {
+        text: String,
+    },
+    Link {
+        text: String,
+        href: Option<String>,
+        interactive_id: Option<String>,
+    },
+    Image {
+        src: Option<String>,
+        alt: String,
+        interactive_id: Option<String>,
+    },
+    List {
+        ordered: bool,
+    },
+    ListItem {
+        text: String,
+    },
+    Table,
+    TableRow,
+    TableCell {
+        header: bool,
+        text: String,
+    },
+    Form {
+        name: Option<String>,
+        action: Option<String>,
+        method: String,
+    },
+    Input {
+        interactive_id: String,
+    },
+    Button {
+        interactive_id: String,
+    },
+    Navigation {
+        label: Option<String>,
+    },
+    Text {
+        text: String,
+    },
+    Fallback {
+        tag: String,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveElement {
+    pub id: String,
+    pub kind: InteractiveKind,
+    pub label: String,
+    pub name: Option<String>,
+    pub value: Option<String>,
+    pub input_type: Option<String>,
+    pub href: Option<String>,
+    pub form_action: Option<String>,
+    pub placeholder: Option<String>,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveKind {
+    Link,
+    Input,
+    Button,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +122,10 @@ impl Document {
         Self {
             url: url.into(),
             title: title.into(),
+            metadata: PageMetadata::default(),
+            content: Vec::new(),
+            interactive: Vec::new(),
+            unsupported_elements: Vec::new(),
             blocks: Vec::new(),
         }
     }
