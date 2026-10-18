@@ -22,4 +22,6 @@ pub enum WebMorphError {
     Cancelled,
     #[error("terminal operation failed: {0}")]
     Terminal(#[from] std::io::Error),
+    #[error("browser storage failed: {0}")]
+    Storage(#[from] crate::storage::StorageError),
 }

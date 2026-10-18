@@ -31,6 +31,10 @@ pub struct Cli {
     /// Website URL to open
     pub url: Option<String>,
 
+    /// Do not read or write persistent browsing history for this session
+    #[arg(long)]
+    pub private: bool,
+
     /// Set log verbosity (overridden by RUST_LOG when present)
     #[arg(short, long, value_enum, default_value = "warn")]
     pub verbosity: Verbosity,

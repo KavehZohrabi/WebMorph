@@ -32,6 +32,7 @@ use crate::{
     html,
     network::HttpClient,
     plugins::PluginRegistry,
+    storage::Storage,
     transform::{ComponentKind, TuiPage, layout_components, transform},
 };
 
@@ -879,21 +880,29 @@ impl TerminalSession {
 
     /// Start the terminal first, then fetch the initial address inside the UI so
     /// users see loading and error states instead of a blank terminal.
-    pub async fn run_url(&mut self, url: String, client: HttpClient) -> Result<()> {
+    pub async fn run_url(
+        &mut self,
+        url: String,
+        client: HttpClient,
+        storage: Storage,
+    ) -> Result<()> {
         let placeholder = transform(&Document::new(url.clone(), "Loading"));
         let state = UiState::new(placeholder);
-        self.run_state(state, Some((url, client))).await
+        self.run_state(state, Some((url, client, Some(storage))))
+            .await
     }
 
     async fn run_state(
         &mut self,
         mut state: UiState,
-        initial: Option<(String, HttpClient)>,
+        initial: Option<(String, HttpClient, Option<Storage>)>,
     ) -> Result<()> {
         let (sender, mut receiver) = mpsc::unbounded_channel::<NavigationResult>();
         let mut request_id = 0u64;
         let mut cancellations: HashMap<u64, CancellationToken> = HashMap::new();
-        if let Some((url, client)) = initial {
+        let mut initial = initial;
+        let mut storage = initial.as_mut().and_then(|(_, _, storage)| storage.take());
+        if let Some((url, client, _)) = initial {
             begin_navigation(
                 &mut state,
                 url,
@@ -920,6 +929,11 @@ impl TerminalSession {
                             let tab = &mut state.tabs[index]; tab.loading = false; tab.error = None;
                             let status = match result.result {
                                 Ok((page, final_url)) => {
+                                    if let Some(storage) = storage.as_mut() {
+                                        if let Err(error) = storage.record_visit(&final_url, &page.title) {
+                                            tracing::warn!(%error, "failed to persist browsing history");
+                                        }
+                                    }
                                     tab.title = page.title.clone(); tab.url = final_url.clone(); tab.form_values = default_form_values(&page.forms); tab.page = page; tab.scroll = 0;
                                     tab.selected_interactive = 0;
                                     if let Some(index) = result.history_target { tab.history_index = index; tab.history[index] = final_url.clone(); }
