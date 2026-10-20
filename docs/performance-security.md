@@ -6,22 +6,30 @@
 document transformation, and terminal layout. It uses the same generated fixture
 before and after the changes: 504,081 bytes, 2,000 paragraphs, 2,000 links, and
 1,000 labeled forms. Results are mean wall time over 30 iterations on the same
-host. This is a targeted microbenchmark, not an allocation profile or a full
-terminal-emulator benchmark; small differences should be treated as noise.
+host. The latest run also exercised interactive and reader viewport paths. This
+is a targeted microbenchmark, not an allocation profile or full terminal-emulator
+benchmark; small differences should be treated as noise.
 
-| Stage | Committed baseline | Updated pipeline |
+| Stage | Earlier pipeline run | TASK-0016 run |
 | --- | ---: | ---: |
-| HTML parse | 347.71 ms | 25.46 ms |
-| Document transform | 20.51 ms | 8.93 ms |
-| Terminal layout | 5.72 ms | 5.49 ms |
+| HTML parse | 25.46 ms | 38.42 ms |
+| Document transform | 8.93 ms | 13.36 ms |
+| Full terminal layout | 5.49 ms | 7.91 ms |
+| Interactive viewport window | — | 6.72 ms |
+| Reader viewport window | — | 6.47 ms |
+| Cached 20-row copy from 4,096-line window | — | 0.0004 ms |
 
-On this form-heavy fixture, parsing was 13.7× faster (92.7% less time),
-transformation was 2.3× faster (56.5% less time), and the standalone layout
-pass was 4.0% faster. A 20-row visible-window copy measured 0.0004 ms; this
-isolates the slice/copy work and is not a full Ratatui render measurement.
+The latest run is slower than the earlier pipeline run on all three shared
+stages. It includes additional semantic-region and interactive-component work;
+the benchmark does not isolate the cost of those additions, so the timings do
+not establish a specific cause. The viewport path retains bounded lines but
+traverses the component tree when rebuilding a window. Reusing the cached window
+and copying 20 visible rows is much cheaper than rebuilding it. These timings do
+not include Ratatui or terminal-device painting.
 
-The baseline revision is `55975f9`. Results measure CPU processing only; they do
-not include network latency, SQLite I/O, or terminal device refresh time.
+The earlier baseline comparison is recorded in the repository history. Results
+measure CPU processing only; they do not include network latency, SQLite I/O, or
+terminal-device refresh time.
 
 ## Changes
 
@@ -29,10 +37,12 @@ not include network latency, SQLite I/O, or terminal device refresh time.
   replacing repeated full-document searches with keyed lookups.
 - Component transformation indexes interactive metadata once, so mapping each
   form control does not rescan the entire interactive-element list.
-- The terminal renders only the visible line window when scrolling, while keeping
-  scroll and mouse row mapping in document-line coordinates.
-- A one-page terminal-layout cache is kept for the active tab and current width;
-  it is capped at 8 MiB and discarded on navigation, resize, or tab switch.
+- The UI releases each loaded page's compatibility line snapshot and renders
+  from its semantic tree into a cached 4,096-line scrolling window. Scroll and
+  mouse row mapping use document-line coordinates. A window is rebuilt when the
+  viewport moves outside its cached range.
+- Cached lines are capped at 8 MiB; inactive tab windows are discarded. The
+  normalized document tree remains in each open tab.
 - Terminal control characters are removed from rendered web content, form
   values, titles, errors, and addresses. The sanitizer edits owned lines in
   place where possible.
@@ -60,9 +70,9 @@ not include network latency, SQLite I/O, or terminal device refresh time.
 - DNS is checked before the request and again by reqwest's resolver, which may
   perform two lookups for a hostname. This favors destination safety over lookup
   latency; no DNS cache was added.
-- The 8 MiB layout cache applies to rendered lines, not the normalized document
-  tree or downloaded body. Those remain bounded by the network response limit
-  and the HTML size itself.
+- The 8 MiB cap applies to active-tab rendered lines, not normalized trees held
+  by open tabs or the downloaded body. Those remain bounded by the response
+  limit and HTML size; there is no total memory quota across tabs.
 - The benchmark does not profile allocator counts, peak resident memory, SQLite
   latency, or actual terminal repaint time. Those need dedicated profiling on
   representative machines before further optimization.

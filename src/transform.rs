@@ -1,6 +1,6 @@
 use crate::dom::{
     ContentBlock, ContentKind, ContentNode, Document, FormDefinition, InteractiveElement,
-    InteractiveKind,
+    InteractiveKind, RegionRole,
 };
 use std::collections::HashMap;
 use unicode_width::UnicodeWidthChar;
@@ -40,6 +40,20 @@ pub enum ComponentKind {
     },
     Navigation {
         label: Option<String>,
+    },
+    Region {
+        role: RegionRole,
+        label: Option<String>,
+    },
+    RepeatedItem,
+    Disclosure {
+        interactive_id: Option<String>,
+        label: String,
+        expanded: bool,
+    },
+    Dialog {
+        label: Option<String>,
+        modal: bool,
     },
     Table,
     TableRow,
@@ -93,6 +107,15 @@ pub struct LayoutHints {
     pub content_width: usize,
     pub compact: bool,
     pub table_mode: TableMode,
+    pub presentation_mode: PresentationMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PresentationMode {
+    #[default]
+    Interactive,
+    Reader,
+    Compact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +130,8 @@ pub struct TuiPage {
     pub root: Component,
     pub layout: LayoutHints,
     pub lines: Vec<String>,
+    /// Total wrapped lines, including lines omitted from the bounded initial snapshot.
+    pub line_count: usize,
     pub forms: Vec<FormDefinition>,
     /// Built-in plugin that adapted the page, if any.
     pub plugin_name: Option<String>,
@@ -132,6 +157,7 @@ pub fn transform_for_width(document: &Document, width: usize) -> TuiPage {
         } else {
             TableMode::Columns
         },
+        presentation_mode: PresentationMode::Interactive,
     };
     let mut children = Vec::new();
     if let Some(description) = &document.metadata.description {
@@ -202,12 +228,14 @@ pub fn transform_for_width(document: &Document, width: usize) -> TuiPage {
         },
         children,
     };
-    let lines = layout_components(&root, width);
+    let (lines, line_count) =
+        layout_components_with_count(&root, width, PresentationMode::Interactive);
     TuiPage {
         title: document.title.clone(),
         root,
         layout,
         lines,
+        line_count,
         forms: document.forms.clone(),
         plugin_name: None,
         plugin_navigation: Vec::new(),
@@ -217,26 +245,111 @@ pub fn transform_for_width(document: &Document, width: usize) -> TuiPage {
 /// Lay out an existing component tree for a concrete viewport width. This
 /// returns plain lines and has no dependency on the terminal renderer.
 pub fn layout_components(root: &Component, width: usize) -> Vec<String> {
+    layout_components_for_mode(root, width, PresentationMode::Interactive)
+}
+
+pub fn layout_components_for_mode(
+    root: &Component,
+    width: usize,
+    presentation_mode: PresentationMode,
+) -> Vec<String> {
+    layout_components_with_count(root, width, presentation_mode).0
+}
+
+pub fn layout_components_with_count(
+    root: &Component,
+    width: usize,
+    presentation_mode: PresentationMode,
+) -> (Vec<String>, usize) {
+    layout_components_window_with_count_for_mode(root, width, 0, usize::MAX, presentation_mode)
+}
+
+/// Layout only retains the requested line window. Large documents can therefore
+/// be scrolled without allocating a second full-page line buffer per redraw.
+pub fn layout_components_window(
+    root: &Component,
+    width: usize,
+    start: usize,
+    count: usize,
+) -> Vec<String> {
+    layout_components_window_for_mode(root, width, start, count, PresentationMode::Interactive)
+}
+
+pub fn layout_components_window_with_count_for_mode(
+    root: &Component,
+    width: usize,
+    start: usize,
+    count: usize,
+    presentation_mode: PresentationMode,
+) -> (Vec<String>, usize) {
     let width = width.max(1);
+    let compact = width < 60 || presentation_mode == PresentationMode::Compact;
     let hints = LayoutHints {
         terminal_width: width,
         content_width: width.saturating_sub(if width > 2 { 2 } else { 0 }).max(1),
-        compact: width < 60,
-        table_mode: if width < 72 {
+        compact,
+        table_mode: if width < 72 || presentation_mode == PresentationMode::Compact {
             TableMode::Stacked
         } else {
             TableMode::Columns
         },
+        presentation_mode,
     };
-    let mut lines = Vec::new();
+    let mut output = LayoutOutput::new(start, count);
     for child in &root.children {
-        render(child, hints, 0, &mut lines);
+        render(child, hints, 0, &mut output);
     }
-    for line in &mut lines {
+    let line_count = output.cursor;
+    for line in &mut output.lines {
         *line = truncate_line(line, hints.content_width);
         strip_terminal_controls_in_place(line);
     }
-    lines
+    (output.lines, line_count)
+}
+
+pub fn layout_components_window_for_mode(
+    root: &Component,
+    width: usize,
+    start: usize,
+    count: usize,
+    presentation_mode: PresentationMode,
+) -> Vec<String> {
+    layout_components_window_with_count_for_mode(root, width, start, count, presentation_mode).0
+}
+
+const MAX_LAYOUT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LAYOUT_OUTPUT_LINES: usize = 100_000;
+
+struct LayoutOutput {
+    start: usize,
+    end: usize,
+    cursor: usize,
+    lines: Vec<String>,
+    stored_bytes: usize,
+}
+
+impl LayoutOutput {
+    fn new(start: usize, count: usize) -> Self {
+        Self {
+            start,
+            end: start.saturating_add(count),
+            cursor: 0,
+            lines: Vec::new(),
+            stored_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        if self.cursor >= self.start
+            && self.cursor < self.end
+            && self.lines.len() < MAX_LAYOUT_OUTPUT_LINES
+            && self.stored_bytes.saturating_add(line.len()) <= MAX_LAYOUT_OUTPUT_BYTES
+        {
+            self.stored_bytes = self.stored_bytes.saturating_add(line.len());
+            self.lines.push(line);
+        }
+        self.cursor = self.cursor.saturating_add(1);
+    }
 }
 
 /// Strip terminal control characters from text originating outside the UI.
@@ -344,6 +457,24 @@ fn map_node(node: &ContentNode, interactive: &HashMap<&str, &InteractiveElement>
         ContentKind::Navigation { label } => ComponentKind::Navigation {
             label: label.clone(),
         },
+        ContentKind::Region { role, label } => ComponentKind::Region {
+            role: *role,
+            label: label.clone(),
+        },
+        ContentKind::RepeatedItem => ComponentKind::RepeatedItem,
+        ContentKind::Disclosure {
+            interactive_id,
+            label,
+            expanded,
+        } => ComponentKind::Disclosure {
+            interactive_id: interactive_id.clone(),
+            label: label.clone(),
+            expanded: *expanded,
+        },
+        ContentKind::Dialog { label, modal } => ComponentKind::Dialog {
+            label: label.clone(),
+            modal: *modal,
+        },
         ContentKind::Text { text } if !text.is_empty() => {
             ComponentKind::TextBlock { text: text.clone() }
         }
@@ -356,7 +487,7 @@ fn map_node(node: &ContentNode, interactive: &HashMap<&str, &InteractiveElement>
     Component { kind, children }
 }
 
-fn render(component: &Component, hints: LayoutHints, depth: usize, out: &mut Vec<String>) {
+fn render(component: &Component, hints: LayoutHints, depth: usize, out: &mut LayoutOutput) {
     let indent = "  ".repeat(depth.min(8));
     match &component.kind {
         ComponentKind::Page { .. } | ComponentKind::Group | ComponentKind::TableRow => {
@@ -365,7 +496,9 @@ fn render(component: &Component, hints: LayoutHints, depth: usize, out: &mut Vec
             }
         }
         ComponentKind::Heading { level, text } => {
-            out.push(String::new());
+            if hints.presentation_mode != PresentationMode::Compact {
+                out.push(String::new());
+            }
             push_wrapped(
                 out,
                 &format!("{} {text}", "#".repeat((*level as usize).clamp(1, 6))),
@@ -376,7 +509,13 @@ fn render(component: &Component, hints: LayoutHints, depth: usize, out: &mut Vec
         ComponentKind::TextBlock { text } => {
             push_wrapped(out, text, hints.content_width, &indent);
             for child in &component.children {
-                if matches!(child.kind, ComponentKind::Link { .. }) {
+                if matches!(
+                    child.kind,
+                    ComponentKind::Link { .. }
+                        | ComponentKind::Input { .. }
+                        | ComponentKind::Button { .. }
+                        | ComponentKind::Disclosure { .. }
+                ) {
                     render(child, hints, depth + 1, out);
                 }
             }
@@ -416,6 +555,9 @@ fn render(component: &Component, hints: LayoutHints, depth: usize, out: &mut Vec
             push_wrapped(out, &format!("• {text}"), hints.content_width, &indent)
         }
         ComponentKind::Navigation { label } => {
+            if hints.presentation_mode == PresentationMode::Reader {
+                return;
+            }
             if let Some(label) = label.as_ref().filter(|s| !s.is_empty()) {
                 push_wrapped(
                     out,
@@ -424,16 +566,90 @@ fn render(component: &Component, hints: LayoutHints, depth: usize, out: &mut Vec
                     &indent,
                 );
             }
-            let mut links = Vec::new();
-            collect_nav_links(component, &mut links);
-            if !links.is_empty() {
-                let separator = if hints.compact { "\n" } else { "  •  " };
-                push_wrapped(out, &links.join(separator), hints.content_width, &indent);
+            if has_navigation_links(component) {
+                render_navigation_links(component, hints, depth + 1, out);
             } else {
                 for child in &component.children {
                     render(child, hints, depth + 1, out);
                 }
             }
+        }
+        ComponentKind::Region { role, label } => {
+            if *role == RegionRole::Sidebar && hints.presentation_mode == PresentationMode::Reader {
+                return;
+            }
+            if let Some(label) = label.as_deref().filter(|label| !label.is_empty()) {
+                push_wrapped(
+                    out,
+                    &format!(
+                        "{}: {label}",
+                        if *role == RegionRole::Main {
+                            "Main content"
+                        } else {
+                            "Sidebar"
+                        }
+                    ),
+                    hints.content_width,
+                    &indent,
+                );
+            }
+            for child in &component.children {
+                render(child, hints, depth + 1, out);
+            }
+        }
+        ComponentKind::RepeatedItem => {
+            for child in &component.children {
+                render(child, hints, depth, out);
+            }
+        }
+        ComponentKind::Disclosure {
+            interactive_id,
+            label,
+            expanded,
+        } => {
+            let expanded = *expanded || hints.presentation_mode == PresentationMode::Reader;
+            let marker = interactive_id
+                .as_deref()
+                .map(|id| format!(" [{id}]"))
+                .unwrap_or_default();
+            let state = if expanded { "−" } else { "+" };
+            let unsupported = if interactive_id.is_none() && !expanded {
+                " (expand in Chromium mode)"
+            } else {
+                ""
+            };
+            push_wrapped(
+                out,
+                &format!("[{state}] {label}{marker}{unsupported}"),
+                hints.content_width,
+                &indent,
+            );
+            if expanded {
+                for child in &component.children {
+                    render(child, hints, depth + 1, out);
+                }
+            }
+        }
+        ComponentKind::Dialog { label, modal } => {
+            let title = label
+                .as_deref()
+                .filter(|label| !label.is_empty())
+                .unwrap_or("Dialog");
+            push_wrapped(
+                out,
+                &format!("┌─ {title}{}", if *modal { " (modal)" } else { "" }),
+                hints.content_width,
+                &indent,
+            );
+            for child in &component.children {
+                render(child, hints, depth + 1, out);
+            }
+            push_wrapped(
+                out,
+                "└─ Close using the dialog's available controls",
+                hints.content_width,
+                &indent,
+            );
         }
         ComponentKind::Table => render_table(component, hints, depth, out),
         ComponentKind::TableCell { .. } => {}
@@ -554,7 +770,7 @@ fn render_list_child(
     hints: LayoutHints,
     depth: usize,
     prefix: &str,
-    out: &mut Vec<String>,
+    out: &mut LayoutOutput,
 ) {
     if let ComponentKind::ListItem { text } = &child.kind {
         push_wrapped(
@@ -587,94 +803,142 @@ fn render_list_child(
     }
 }
 
-fn render_table(table: &Component, hints: LayoutHints, depth: usize, out: &mut Vec<String>) {
-    let mut rows = Vec::new();
-    collect_table_rows(table, &mut rows);
-    let headers = rows
-        .iter()
-        .find_map(|r| {
-            let found = r
+fn render_table(table: &Component, hints: LayoutHints, depth: usize, out: &mut LayoutOutput) {
+    let headers = table_headers(table).unwrap_or_default();
+    render_table_rows(table, &headers, hints, depth, out);
+}
+
+fn table_headers(component: &Component) -> Option<Vec<&str>> {
+    for child in &component.children {
+        if matches!(child.kind, ComponentKind::TableRow) {
+            let headers = child
                 .children
                 .iter()
-                .filter_map(|c| match &c.kind {
+                .filter_map(|cell| match &cell.kind {
                     ComponentKind::TableCell { header: true, text } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            (!found.is_empty()).then_some(found)
-        })
-        .unwrap_or_default();
-    for row in rows {
-        let cells = row
-            .children
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                ComponentKind::TableCell { header, text } => Some((*header, text.as_str())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if cells.is_empty() {
-            continue;
-        }
-        if hints.table_mode == TableMode::Columns {
-            push_wrapped(
-                out,
-                &cells
-                    .iter()
-                    .map(|(_, text)| *text)
-                    .collect::<Vec<_>>()
-                    .join(" │ "),
-                hints.content_width,
-                &"  ".repeat(depth.min(8)),
-            );
-        } else if cells.iter().any(|(header, _)| *header) {
-            for (_, text) in cells {
-                push_wrapped(
-                    out,
-                    text,
-                    hints.content_width.saturating_sub(2).max(1),
-                    "  ",
-                );
+            if !headers.is_empty() {
+                return Some(headers);
             }
-        } else {
-            for (index, (_, text)) in cells.iter().enumerate() {
-                let label = headers.get(index).copied().unwrap_or("Value");
+        } else if let Some(headers) = table_headers(child) {
+            return Some(headers);
+        }
+    }
+    None
+}
+
+fn render_table_rows(
+    component: &Component,
+    headers: &[&str],
+    hints: LayoutHints,
+    depth: usize,
+    out: &mut LayoutOutput,
+) {
+    for row in &component.children {
+        if matches!(row.kind, ComponentKind::TableRow) {
+            let cells = row
+                .children
+                .iter()
+                .filter_map(|cell| match &cell.kind {
+                    ComponentKind::TableCell { header, text } => {
+                        Some((*header, text.as_str(), cell))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if cells.is_empty() {
+                continue;
+            }
+            if hints.table_mode == TableMode::Columns {
                 push_wrapped(
                     out,
-                    &format!("{label}: {text}"),
+                    &cells
+                        .iter()
+                        .map(|(_, text, cell)| format!("{text}{}", interactive_markers(cell)))
+                        .collect::<Vec<_>>()
+                        .join(" │ "),
                     hints.content_width,
                     &"  ".repeat(depth.min(8)),
                 );
+            } else if cells.iter().any(|(header, _, _)| *header) {
+                for (_, text, cell) in cells {
+                    push_wrapped(
+                        out,
+                        &format!("{text}{}", interactive_markers(cell)),
+                        hints.content_width.saturating_sub(2).max(1),
+                        "  ",
+                    );
+                }
+            } else {
+                for (index, (_, text, cell)) in cells.iter().enumerate() {
+                    let label = headers.get(index).copied().unwrap_or("Value");
+                    push_wrapped(
+                        out,
+                        &format!("{label}: {text}{}", interactive_markers(cell)),
+                        hints.content_width,
+                        &"  ".repeat(depth.min(8)),
+                    );
+                }
             }
+        } else {
+            render_table_rows(row, headers, hints, depth, out);
         }
     }
 }
 
-fn collect_table_rows<'a>(component: &'a Component, rows: &mut Vec<&'a Component>) {
-    for child in &component.children {
-        if matches!(child.kind, ComponentKind::TableRow) {
-            rows.push(child);
-        } else {
-            collect_table_rows(child, rows);
+fn interactive_markers(component: &Component) -> String {
+    fn collect(component: &Component, markers: &mut Vec<String>) {
+        match &component.kind {
+            ComponentKind::Link {
+                interactive_id: Some(id),
+                ..
+            }
+            | ComponentKind::Input {
+                interactive_id: id, ..
+            }
+            | ComponentKind::Button {
+                interactive_id: id, ..
+            }
+            | ComponentKind::Disclosure {
+                interactive_id: Some(id),
+                ..
+            } => markers.push(format!("[{id}]")),
+            _ => {}
         }
+        for child in &component.children {
+            collect(child, markers);
+        }
+    }
+    let mut markers = Vec::new();
+    for child in &component.children {
+        collect(child, &mut markers);
+    }
+    if markers.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", markers.join(" "))
     }
 }
 
-fn collect_nav_links(component: &Component, links: &mut Vec<String>) {
+fn has_navigation_links(component: &Component) -> bool {
+    component.children.iter().any(|child| {
+        matches!(child.kind, ComponentKind::Link { .. }) || has_navigation_links(child)
+    })
+}
+
+fn render_navigation_links(
+    component: &Component,
+    hints: LayoutHints,
+    depth: usize,
+    out: &mut LayoutOutput,
+) {
     for child in &component.children {
-        if let ComponentKind::Link {
-            text,
-            interactive_id,
-            ..
-        } = &child.kind
-        {
-            let marker = interactive_id
-                .as_deref()
-                .map(|id| format!(" [{id}]"))
-                .unwrap_or_default();
-            links.push(format!("↗ {text}{marker}"));
+        if matches!(child.kind, ComponentKind::Link { .. }) {
+            render(child, hints, depth, out);
         } else {
-            collect_nav_links(child, links);
+            render_navigation_links(child, hints, depth, out);
         }
     }
 }
@@ -719,17 +983,67 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn push_wrapped(out: &mut Vec<String>, text: &str, width: usize, prefix: &str) {
-    let continuation = " ".repeat(display_width(prefix));
-    for (index, line) in wrap_text(text, width.saturating_sub(display_width(prefix)).max(1))
-        .into_iter()
-        .enumerate()
-    {
+fn push_wrapped(out: &mut LayoutOutput, text: &str, width: usize, prefix: &str) {
+    let prefix = fit_prefix(prefix, width.saturating_sub(1));
+    let continuation = " ".repeat(display_width(&prefix));
+    let line_width = width.saturating_sub(display_width(&prefix)).max(1);
+    let mut line = String::new();
+    let mut used = 0usize;
+    let mut first = true;
+    let push_line = |line: &mut String, first: &mut bool, out: &mut LayoutOutput| {
         out.push(format!(
             "{}{line}",
-            if index == 0 { prefix } else { &continuation }
+            if *first {
+                prefix.as_str()
+            } else {
+                &continuation
+            }
         ));
+        *first = false;
+        line.clear();
+    };
+    for word in text.split_whitespace() {
+        let word_width = display_width(word);
+        if used > 0 && used + 1 + word_width <= line_width {
+            line.push(' ');
+            line.push_str(word);
+            used += 1 + word_width;
+        } else if used == 0 && word_width <= line_width {
+            line.push_str(word);
+            used = word_width;
+        } else {
+            if !line.is_empty() {
+                push_line(&mut line, &mut first, out);
+                used = 0;
+            }
+            for character in word.chars() {
+                let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+                if used > 0 && used + character_width > line_width {
+                    push_line(&mut line, &mut first, out);
+                    used = 0;
+                }
+                line.push(character);
+                used += character_width;
+            }
+        }
     }
+    if !line.is_empty() || first {
+        push_line(&mut line, &mut first, out);
+    }
+}
+
+fn fit_prefix(prefix: &str, max_width: usize) -> String {
+    let mut output = String::new();
+    let mut width: usize = 0;
+    for character in prefix.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width.saturating_add(character_width) > max_width {
+            break;
+        }
+        output.push(character);
+        width += character_width;
+    }
+    output
 }
 
 fn display_width(text: &str) -> usize {
@@ -764,8 +1078,8 @@ fn truncate_line(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Component, ComponentKind, TableMode, layout_components, transform, transform_for_width,
-        wrap_text,
+        Component, ComponentKind, PresentationMode, TableMode, layout_components,
+        layout_components_for_mode, transform, transform_for_width, wrap_text,
     };
     use crate::{dom::Document, html};
 
@@ -851,6 +1165,79 @@ mod tests {
         assert_eq!(wrap_text("界a", 1), vec!["界", "a"]);
         let page = transform_for_width(&Document::new("x", "Tiny"), 0);
         assert_eq!(page.layout.terminal_width, 1);
+    }
+
+    #[test]
+    fn semantic_regions_disclosures_dialogs_and_table_controls_are_preserved() {
+        let document = html::parse(
+            "https://example.test/",
+            "<nav aria-label='Primary'><a href='/home'>Home</a></nav><main><h1>Article</h1><details><summary>More</summary><p>Expanded text</p></details><dialog open aria-label='Alert' aria-modal='true'><p>Dialog text</p></dialog><table><tr><th>Item</th></tr><tr><td><a href='/item'>Open</a></td></tr></table></main><aside aria-label='Related'><a href='/other'>Other</a></aside>",
+        );
+        assert!(matches!(
+            document.content[0].kind,
+            crate::dom::ContentKind::Navigation { .. }
+        ));
+        assert!(document.content.iter().any(|node| matches!(
+            node.kind,
+            crate::dom::ContentKind::Region {
+                role: crate::dom::RegionRole::Main,
+                ..
+            }
+        )));
+
+        let page = transform(&document);
+        let interactive =
+            layout_components_for_mode(&page.root, 80, PresentationMode::Interactive).join("\n");
+        let reader =
+            layout_components_for_mode(&page.root, 80, PresentationMode::Reader).join("\n");
+        assert!(interactive.contains("Navigation: Primary"));
+        assert!(interactive.contains("Sidebar: Related"));
+        assert!(interactive.contains("[+] More"));
+        assert!(interactive.contains("Dialog text"));
+        assert!(interactive.contains("[wm-"));
+        assert!(!reader.contains("Navigation: Primary"));
+        assert!(!reader.contains("Sidebar: Related"));
+        assert!(reader.contains("Expanded text"));
+    }
+
+    #[test]
+    fn layout_windows_match_full_layout_across_terminal_sizes_and_modes() {
+        let document = html::parse(
+            "https://example.test/",
+            "<main><h1>Terminal layout</h1><nav><a href='/a'>A long navigation destination</a></nav><details open><summary>Details</summary><p>Readable expanded content across many widths.</p></details><table><tr><th>Key</th><th>Value</th></tr><tr><td>One</td><td>Two</td></tr></table><aside>Related material</aside></main>",
+        );
+        let page = transform(&document);
+        for width in [1, 2, 18, 32, 59, 60, 71, 72, 80, 120] {
+            for mode in [
+                PresentationMode::Interactive,
+                PresentationMode::Reader,
+                PresentationMode::Compact,
+            ] {
+                let full = layout_components_for_mode(&page.root, width, mode);
+                let (window, total) = super::layout_components_window_with_count_for_mode(
+                    &page.root, width, 0, 4, mode,
+                );
+                assert_eq!(window, full.iter().take(4).cloned().collect::<Vec<_>>());
+                assert_eq!(total, full.len());
+                let start = full.len().min(2);
+                let count = full.len().saturating_sub(start).min(3);
+                assert_eq!(
+                    super::layout_components_window_for_mode(&page.root, width, start, count, mode,),
+                    full[start..start + count].to_vec(),
+                    "window mismatch at width {width} mode {mode:?} start {start} count {count}"
+                );
+                assert!(
+                    full.iter().all(|line| {
+                        line.chars()
+                            .map(unicode_width::UnicodeWidthChar::width)
+                            .map(|width| width.unwrap_or(0))
+                            .sum::<usize>()
+                            <= width.saturating_sub(if width > 2 { 2 } else { 0 }).max(1)
+                    }),
+                    "width={width} mode={mode:?} lines={full:?}"
+                );
+            }
+        }
     }
 
     #[test]

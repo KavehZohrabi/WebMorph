@@ -2,7 +2,9 @@ use std::{hint::black_box, time::Instant};
 
 use webmorph::{
     html,
-    transform::{layout_components, transform},
+    transform::{
+        PresentationMode, layout_components, layout_components_window_for_mode, transform,
+    },
 };
 
 fn main() {
@@ -43,8 +45,32 @@ fn main() {
     report("terminal layout", start.elapsed(), iterations);
     let start = Instant::now();
     for _ in 0..iterations {
+        black_box(layout_components_window_for_mode(
+            black_box(&page.root),
+            80,
+            400,
+            24,
+            PresentationMode::Interactive,
+        ));
+    }
+    report("virtualized viewport layout", start.elapsed(), iterations);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        black_box(layout_components_window_for_mode(
+            black_box(&page.root),
+            80,
+            400,
+            24,
+            PresentationMode::Reader,
+        ));
+    }
+    report("reader viewport layout", start.elapsed(), iterations);
+    let bounded_window =
+        layout_components_window_for_mode(&page.root, 80, 0, 4096, PresentationMode::Interactive);
+    let start = Instant::now();
+    for _ in 0..iterations {
         black_box(
-            page.lines
+            bounded_window
                 .iter()
                 .skip(200)
                 .take(20)
@@ -52,7 +78,11 @@ fn main() {
                 .collect::<Vec<_>>(),
         );
     }
-    report("cached visible-window copy", start.elapsed(), iterations);
+    report(
+        "cached bounded-window visible-row copy",
+        start.elapsed(),
+        iterations,
+    );
     eprintln!(
         "fixture: {} bytes; 2,000 paragraphs, 2,000 links, 1,000 labeled forms",
         source.len()

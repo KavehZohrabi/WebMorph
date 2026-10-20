@@ -24,6 +24,8 @@ async fn local_page() -> String {
             let body = r#"<!doctype html><html><head><title>Interactive fixture</title></head><body>
                 <main><h1 id="result">Ready</h1>
                 <span id="aria-action-label">Accessible action</span><button aria-labelledby="aria-action-label" onclick="document.querySelector('#result').textContent='Accessible click'"></button>
+                <details><summary>More details</summary><p>Revealed disclosure content</p></details>
+                <dialog open aria-modal="true"><p>Modal dialog content</p><button onclick="this.closest('dialog').close()">Close dialog</button></dialog>
                 <a id="route" href="/client-route" aria-label="Client route">Route</a>
                 <button id="dynamic" aria-label="Dynamic button" onclick="document.querySelector('#result').textContent='Clicked'; document.body.insertAdjacentHTML('afterbegin', '<button aria-label=&quot;Inserted later&quot;>Later</button>')">Click</button>
                 <form id="form" onsubmit="event.preventDefault(); document.querySelector('#result').textContent='Submitted: '+document.querySelector('#message').value+' / '+document.querySelector('#choice').value">
@@ -94,6 +96,29 @@ async fn persistent_chromium_session_applies_real_dom_actions_and_refreshes_tui_
         .await
         .unwrap();
     assert!(text(&page).contains("Accessible click"));
+    let disclosure = page
+        .interactive
+        .iter()
+        .find(|element| element.label == "More details")
+        .unwrap()
+        .id
+        .clone();
+    let (page, _) = engine
+        .interact(
+            17,
+            BrowserInteraction::Click {
+                interactive_id: disclosure,
+            },
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(text(&page).contains("Revealed disclosure content"));
+    let (page, _) = engine
+        .interact(17, BrowserInteraction::DismissDialog, token.clone())
+        .await
+        .unwrap();
+    assert!(!text(&page).contains("Modal dialog content"));
     let route_key = page
         .interactive
         .iter()

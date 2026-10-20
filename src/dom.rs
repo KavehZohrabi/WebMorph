@@ -81,6 +81,20 @@ pub enum ContentKind {
     Navigation {
         label: Option<String>,
     },
+    Region {
+        role: RegionRole,
+        label: Option<String>,
+    },
+    RepeatedItem,
+    Disclosure {
+        interactive_id: Option<String>,
+        label: String,
+        expanded: bool,
+    },
+    Dialog {
+        label: Option<String>,
+        modal: bool,
+    },
     Text {
         text: String,
     },
@@ -140,6 +154,13 @@ pub enum InteractiveKind {
     Link,
     Input,
     Button,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionRole {
+    Main,
+    Sidebar,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -485,7 +485,11 @@ pub fn apply_report_to_page(page: &mut crate::transform::TuiPage, report: Plugin
     if let Some(failure) = report.failure {
         tracing::debug!(%failure, "generic page fallback active");
     }
-    page.lines = crate::transform::layout_components(&page.root, page.layout.terminal_width);
+    (page.lines, page.line_count) = crate::transform::layout_components_with_count(
+        &page.root,
+        page.layout.terminal_width,
+        crate::transform::PresentationMode::Interactive,
+    );
 }
 
 #[cfg(test)]

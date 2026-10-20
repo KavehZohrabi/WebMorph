@@ -25,6 +25,7 @@ pub enum BrowserInteraction {
     SubmitForm {
         form_index: usize,
     },
+    DismissDialog,
     Scroll {
         delta: i32,
     },
@@ -150,7 +151,7 @@ mod chromium {
         let key = serde_json::to_string(key)
             .map_err(|error| WebMorphError::Browser(error.to_string()))?;
         Ok(format!(
-            "[...document.querySelectorAll('a[href],button,input,textarea,select,[role=\"button\"]')].find(node => window.__webmorphElementKeys?.get(node) === {key})"
+            "[...document.querySelectorAll('a[href],button,input,textarea,select,summary,[role=\"button\"]')].find(node => window.__webmorphElementKeys?.get(node) === {key})"
         ))
     }
 
@@ -311,13 +312,13 @@ mod chromium {
             }
             let expression = format!(
                 r#"(() => {{
-                  const nodes = [...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"]')];
+                  const nodes = [...document.querySelectorAll('a[href],button,input,textarea,select,summary,[role="button"]')];
                   const keys = window.__webmorphElementKeys || (window.__webmorphElementKeys = new WeakMap());
                   let nextKey = window.__webmorphNextElementKey || 0;
                   nodes.forEach(node => {{ if (!keys.has(node)) keys.set(node, `wm-${{nextKey++}}`); }});
                   window.__webmorphNextElementKey = nextKey;
                   const clone = document.documentElement.cloneNode(true);
-                  const clonedNodes = [...clone.querySelectorAll('a[href],button,input,textarea,select,[role="button"]')];
+                  const clonedNodes = [...clone.querySelectorAll('a[href],button,input,textarea,select,summary,[role="button"]')];
                   nodes.forEach((node, index) => {{
                     const cloneNode = clonedNodes[index];
                     if (!cloneNode) return;
@@ -326,6 +327,11 @@ mod chromium {
                       const label = node.getAttribute('aria-labelledby').split(/\s+/).map(id => document.getElementById(id)?.textContent?.trim()).filter(Boolean).join(' ');
                       if (label) cloneNode.setAttribute('aria-label', label);
                     }}
+                  }});
+                  const sourceDialogs = [...document.querySelectorAll('dialog')];
+                  const clonedDialogs = [...clone.querySelectorAll('dialog')];
+                  sourceDialogs.forEach((dialog, index) => {{
+                    if (dialog.matches(':modal')) clonedDialogs[index]?.setAttribute('aria-modal', 'true');
                   }});
                   const sourceControls = [...document.querySelectorAll('input,textarea,select')];
                   const clonedControls = [...clone.querySelectorAll('input,textarea,select')];
@@ -489,6 +495,7 @@ mod chromium {
                 BrowserInteraction::SubmitForm { form_index } => format!(
                     "(() => {{ const form = document.forms[{form_index}]; if (!form) return false; form.requestSubmit(); return true; }})()"
                 ),
+                BrowserInteraction::DismissDialog => "(() => { const dialog = document.querySelector('dialog[open]'); if (!dialog) return false; dialog.close(); return true; })()".into(),
                 BrowserInteraction::Scroll { delta } => format!(
                     "(() => {{ window.scrollBy({{top: {}, behavior: 'instant'}}); return true; }})()",
                     delta

@@ -36,13 +36,15 @@ use crate::{
     plugins::PluginRegistry,
     storage::Storage,
     transform::{
-        ComponentKind, TuiPage, layout_components, strip_terminal_controls,
+        ComponentKind, PresentationMode, TuiPage, layout_components_window_for_mode,
+        layout_components_window_with_count_for_mode, strip_terminal_controls,
         strip_terminal_controls_in_place, transform,
     },
 };
 
 const TICK: Duration = Duration::from_millis(35);
-const MAX_LAYOUT_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const LAYOUT_CACHE_LINES: usize = 4096;
+const LAYOUT_CACHE_BACKTRACK: usize = 256;
 type FormValues = HashMap<String, Zeroizing<String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +84,7 @@ struct BrowserTab {
     selected_interactive: usize,
     request_id: u64,
     form_values: FormValues,
-    layout_cache: Option<(usize, u64, Vec<String>)>,
+    layout_cache: Option<(usize, u64, PresentationMode, usize, usize, Vec<String>)>,
     chromium_session: bool,
 }
 
@@ -135,6 +137,7 @@ struct UiState {
     selected_interactive: usize,
     dialog: Option<Dialog>,
     theme: Theme,
+    presentation_mode: PresentationMode,
     status: String,
     loading_frame: usize,
     dirty: bool,
@@ -181,6 +184,7 @@ impl UiState {
             selected_interactive: 0,
             dialog: None,
             theme: Theme::Auto,
+            presentation_mode: PresentationMode::Interactive,
             status: "Ready".into(),
             loading_frame: 0,
             dirty: true,
@@ -204,6 +208,24 @@ impl UiState {
         self.browser_backend
             .clone()
             .or_else(|| self.fallback_browser_backend.clone())
+    }
+
+    fn targets(&self) -> Vec<InteractiveTarget> {
+        interactive_targets(&self.tab().page, self.presentation_mode)
+    }
+
+    fn cycle_presentation_mode(&mut self) {
+        self.presentation_mode = match self.presentation_mode {
+            PresentationMode::Interactive => PresentationMode::Reader,
+            PresentationMode::Reader => PresentationMode::Compact,
+            PresentationMode::Compact => PresentationMode::Interactive,
+        };
+        self.tab_mut().layout_cache = None;
+        self.selected_interactive = self
+            .selected_interactive
+            .min(self.targets().len().saturating_sub(1));
+        self.status = format!("View: {}", presentation_mode_label(self.presentation_mode));
+        self.dirty = true;
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
@@ -274,6 +296,15 @@ impl UiState {
                         value: value.to_string(),
                     });
                 }
+                return UiAction::None;
+            }
+            if self.focus == Focus::Content && component_has_dialog(&self.tab().page.root) {
+                if self.active_browser().is_some() {
+                    return UiAction::BrowserInteraction(BrowserInteraction::DismissDialog);
+                }
+                self.status =
+                    "Use the dialog's visible controls; closing it requires Chromium mode".into();
+                self.dirty = true;
                 return UiAction::None;
             }
             if self.tab().loading {
@@ -363,7 +394,17 @@ impl UiState {
                 UiAction::None
             }
             KeyCode::End | KeyCode::Char('G') => {
-                self.tab_mut().scroll = self.tab().page.lines.len();
+                let total = self.tab().layout_cache.as_ref().map_or(
+                    self.tab().page.line_count,
+                    |(_, _, mode, _, count, _)| {
+                        if *mode == self.presentation_mode {
+                            *count
+                        } else {
+                            self.tab().page.line_count
+                        }
+                    },
+                );
+                self.tab_mut().scroll = total;
                 self.dirty = true;
                 UiAction::None
             }
@@ -393,6 +434,10 @@ impl UiState {
                 };
                 self.status = format!("Theme: {:?}", self.theme);
                 self.dirty = true;
+                UiAction::None
+            }
+            KeyCode::Char('v' | 'V') => {
+                self.cycle_presentation_mode();
                 UiAction::None
             }
             KeyCode::Char('q' | 'Q') => UiAction::Quit,
@@ -461,7 +506,7 @@ impl UiState {
         if self.focus == Focus::Tabs {
             return UiAction::None;
         }
-        let targets = interactive_targets(&self.tab().page);
+        let targets = self.targets();
         let Some(target) = targets.get(self.selected_interactive).cloned() else {
             return UiAction::None;
         };
@@ -717,7 +762,7 @@ impl UiState {
     }
 
     fn selected_select(&self) -> Option<FormControl> {
-        interactive_targets(&self.tab().page)
+        self.targets()
             .get(self.selected_interactive)
             .and_then(|target| target.form_control.clone())
             .filter(|control| control.control_type == "select")
@@ -750,7 +795,7 @@ impl UiState {
     }
 
     fn sync_select(&self, interactive_id: String) -> UiAction {
-        if self.browser_backend.is_none() {
+        if self.active_browser().is_none() {
             return UiAction::None;
         }
         let value = self
@@ -769,7 +814,7 @@ impl UiState {
         if self.focus != Focus::Content {
             return UiAction::None;
         }
-        let targets = interactive_targets(&self.tab().page);
+        let targets = self.targets();
         let Some(target) = targets.get(self.selected_interactive) else {
             return UiAction::None;
         };
@@ -785,14 +830,21 @@ impl UiState {
 
     fn move_focus(&mut self, forward: bool) {
         if self.focus == Focus::Content {
-            let count = interactive_targets(&self.tab().page).len();
-            if forward && self.selected_interactive + 1 < count {
-                self.selected_interactive += 1;
-                return;
-            }
-            if !forward && self.selected_interactive > 0 {
-                self.selected_interactive -= 1;
-                return;
+            let targets = self.targets();
+            let count = targets.len();
+            for step in 1..count {
+                let index = if forward {
+                    self.selected_interactive
+                        .checked_add(step)
+                        .filter(|index| *index < count)
+                } else {
+                    self.selected_interactive.checked_sub(step)
+                };
+                let Some(index) = index else { break };
+                if !targets[index].disabled {
+                    self.selected_interactive = index;
+                    return;
+                }
             }
         }
         let order = [Focus::Address, Focus::Tabs, Focus::Content, Focus::Help];
@@ -805,9 +857,7 @@ impl UiState {
         if self.focus == Focus::Content {
             self.selected_interactive = 0;
             if !forward {
-                self.selected_interactive = interactive_targets(&self.tab().page)
-                    .len()
-                    .saturating_sub(1);
+                self.selected_interactive = self.targets().len().saturating_sub(1);
             }
         }
         if self.focus == Focus::Address {
@@ -924,6 +974,11 @@ impl UiState {
                     }
                     self.address = self.tab().url.clone();
                     self.focus = Focus::Tabs;
+                } else if area.height >= 11
+                    && y == area.height.saturating_sub(2)
+                    && mouse.column.saturating_sub(area.x) < 14
+                {
+                    self.cycle_presentation_mode();
                 } else if area.height >= 7 && y >= area.height.saturating_sub(1) {
                     self.dialog = Some(Dialog::Help);
                 } else if y >= content_start
@@ -935,9 +990,15 @@ impl UiState {
                 {
                     self.focus = Focus::Content;
                     let visible_row = (y - content_start) as usize + self.tab().scroll;
-                    let lines = layout_components(&self.tab().page.root, area.width as usize);
-                    if let Some(line) = lines.get(visible_row) {
-                        let targets = interactive_targets(&self.tab().page);
+                    let lines = layout_components_window_for_mode(
+                        &self.tab().page.root,
+                        area.width as usize,
+                        visible_row,
+                        1,
+                        self.presentation_mode,
+                    );
+                    if let Some(line) = lines.first() {
+                        let targets = self.targets();
                         if let Some((index, target)) = targets
                             .iter()
                             .enumerate()
@@ -1080,26 +1141,39 @@ impl TerminalSession {
         tokio::pin!(shutdown);
         loop {
             if state.dirty {
-                let width = self.terminal.size()?.width.saturating_sub(2).max(1) as usize;
+                let width = self.terminal.size()?.width.max(1) as usize;
+                let presentation_mode = state.presentation_mode;
                 for (index, tab) in state.tabs.iter_mut().enumerate() {
                     if index != state.active_tab {
                         tab.layout_cache = None;
                     }
                 }
                 let tab = state.tab_mut();
-                if tab
-                    .layout_cache
-                    .as_ref()
-                    .is_none_or(|(cached_width, request, _)| {
-                        *cached_width != width || *request != tab.request_id
-                    })
-                {
-                    let lines = layout_components(&tab.page.root, width);
-                    let bytes = lines
-                        .iter()
-                        .fold(0usize, |total, line| total.saturating_add(line.len()));
-                    tab.layout_cache =
-                        (bytes <= MAX_LAYOUT_CACHE_BYTES).then_some((width, tab.request_id, lines));
+                if tab.layout_cache.as_ref().is_none_or(
+                    |(cached_width, request, cached_mode, start, _, lines)| {
+                        *cached_width != width
+                            || *request != tab.request_id
+                            || *cached_mode != presentation_mode
+                            || tab.scroll < *start
+                            || tab.scroll >= start.saturating_add(lines.len())
+                    },
+                ) {
+                    let start = tab.scroll.saturating_sub(LAYOUT_CACHE_BACKTRACK);
+                    let (lines, total_lines) = layout_components_window_with_count_for_mode(
+                        &tab.page.root,
+                        width,
+                        start,
+                        LAYOUT_CACHE_LINES,
+                        presentation_mode,
+                    );
+                    tab.layout_cache = Some((
+                        width,
+                        tab.request_id,
+                        presentation_mode,
+                        start,
+                        total_lines,
+                        lines,
+                    ));
                 }
                 self.draw(&state)?;
                 state.dirty = false;
@@ -1113,7 +1187,7 @@ impl TerminalSession {
                             let tab = &mut state.tabs[index]; tab.loading = false; tab.error = None;
                             if result.result.is_ok() && !result.is_interaction { tab.chromium_session = result.used_chromium; }
                             let status = match result.result {
-                                Ok((page, final_url, diagnostic)) => {
+                                Ok((mut page, final_url, diagnostic)) => {
                                     if let Some(storage) = storage.as_mut()
                                         && let Err(error) = storage.record_visit(&final_url, &page.title)
                                     {
@@ -1132,6 +1206,11 @@ impl TerminalSession {
                                             }
                                         }
                                     }
+                                    // The semantic tree is the source of truth for the UI.
+                                    // Drop the compatibility line snapshot so each open tab
+                                    // retains only its bounded scrolling window.
+                                    page.lines.clear();
+                                    page.lines.shrink_to_fit();
                                     tab.page = page; tab.scroll = 0; tab.layout_cache = None;
                                     if !result.is_interaction { tab.selected_interactive = 0; }
                                     if let Some(index) = result.history_target { tab.history_index = index; tab.history[index] = final_url.clone(); }
@@ -1300,16 +1379,28 @@ impl TerminalSession {
                 frame.render_widget(Paragraph::new(Text::from(lines)).block(Block::default().title("Load error").borders(Borders::ALL).border_style(theme.error).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), content_area);
             } else {
                 let fallback_lines;
-                let page_lines = if let Some((_, _, lines)) = &tab.layout_cache {
-                    lines.as_slice()
+                let visible_rows = content_area.height.saturating_sub(2) as usize;
+                let page_lines = if let Some((width, request, mode, start, _, lines)) = &tab.layout_cache
+                    && *width == content_area.width as usize
+                    && *request == tab.request_id
+                    && *mode == state.presentation_mode
+                    && tab.scroll >= *start
+                    && tab.scroll < start.saturating_add(lines.len())
+                {
+                    visible_window(lines, tab.scroll - start, visible_rows)
                 } else {
-                    fallback_lines = layout_components(&tab.page.root, content_area.width as usize);
+                    fallback_lines = layout_components_window_for_mode(
+                        &tab.page.root,
+                        content_area.width as usize,
+                        tab.scroll,
+                        visible_rows,
+                        state.presentation_mode,
+                    );
                     fallback_lines.as_slice()
                 };
-                let controls = interactive_targets(&tab.page);
+                let controls = interactive_targets(&tab.page, state.presentation_mode);
                 let mut lines = Vec::new();
-                let visible_rows = content_area.height.saturating_sub(2) as usize;
-                for text in visible_window(page_lines, tab.scroll, visible_rows) {
+                for text in page_lines {
                     let mut shown = render_form_line(text, &controls, tab);
                     strip_terminal_controls_in_place(&mut shown);
                     let shown = if self.ascii { to_ascii(&shown) } else { shown };
@@ -1320,19 +1411,20 @@ impl TerminalSession {
                 frame.render_widget(Paragraph::new(Text::from(lines)).block(Block::default().title(safe_title).borders(Borders::ALL).border_style(if state.focus == Focus::Content { theme.accent } else { theme.border }).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), content_area);
             }
             if status_area.height > 0 {
-                let label = if state.tab().loading { format!("LOADING  {}", state.tab().url) } else if state.tab().error.is_some() { format!("ERROR  {}", state.status) } else { format!("{}  ·  {}", state.status, state.tab().url) };
+                let mode = presentation_mode_label(state.presentation_mode);
+                let label = if state.tab().loading { format!("{mode}  ·  LOADING  {}", state.tab().url) } else if state.tab().error.is_some() { format!("{mode}  ·  ERROR  {}", state.status) } else { format!("{mode}  ·  {}  ·  {}", state.status, state.tab().url) };
                 let label = strip_terminal_controls(&label);
                 let label = if self.ascii { to_ascii(&label) } else { label };
                 frame.render_widget(Paragraph::new(label).style(if state.tab().error.is_some() { theme.error } else { theme.status }), status_area);
             }
             if help_area.height > 0 {
-                let help = match state.focus { Focus::Address => "Enter: open   Esc: leave address   Ctrl+L: focus address   Ctrl+Q: quit", Focus::Tabs => "←/→ or ↑/↓: switch tabs   Ctrl+Tab: cycle   Ctrl+T: new tab   Ctrl+W: close", Focus::Content => "Tab: next control   Enter: open   Shift+Enter: new tab   Alt+Enter: system browser   Ctrl+L: address", Focus::Help => "Enter: help   Esc: close   Ctrl+Q: quit" };
+                let help = match state.focus { Focus::Address => "Enter: open   Esc: leave address   Ctrl+L: focus address   Ctrl+Q: quit", Focus::Tabs => "←/→ or ↑/↓: switch tabs   Ctrl+Tab: cycle   Ctrl+T: new tab   Ctrl+W: close", Focus::Content => "Tab: next control   Enter: activate   Shift+Enter: new tab   v: view mode   Alt+Enter: system browser", Focus::Help => "Enter: help   Esc: close   Ctrl+Q: quit" };
                 frame.render_widget(Paragraph::new(if self.ascii { to_ascii(help) } else { help.into() }).style(theme.muted), help_area);
             }
             if state.dialog == Some(Dialog::Help) {
                 let width = area.width.clamp(24, 76); let height = area.height.clamp(7, 21);
                 let popup = centered(area, width, height);
-                let help = vec![Line::styled("Keyboard and mouse", theme.accent.add_modifier(Modifier::BOLD)), Line::raw(""), Line::raw("Tab / Shift+Tab  Move between controls"), Line::raw("Enter           Edit a field or activate a control"), Line::raw("Space           Toggle a checkbox or radio option"), Line::raw("Arrow keys      Scroll pages; choose select options"), Line::raw("Shift+Enter     Open a selected link in a new tab"), Line::raw("Alt+Enter       Open a selected link in system browser"), Line::raw("Ctrl+L          Focus the address bar"), Line::raw("Ctrl+T / Ctrl+W New tab / close tab"), Line::raw("Ctrl+Tab        Next tab; Ctrl+Shift+Tab previous tab"), Line::raw("h               Home (site root)"), Line::raw("[ / ]           Back / forward; r reloads"), Line::raw("Ctrl+Q          Quit"), Line::raw("Mouse           Click fields and controls; wheel to scroll"), Line::raw("POST submissions ask for confirmation"), Line::raw(""), Line::styled("Esc: close this panel", theme.muted)];
+                let help = vec![Line::styled("Keyboard and mouse", theme.accent.add_modifier(Modifier::BOLD)), Line::raw(""), Line::raw("Tab / Shift+Tab  Move between controls"), Line::raw("Enter           Edit a field or activate a control"), Line::raw("Space           Toggle a checkbox or radio option"), Line::raw("Arrow keys      Scroll pages; choose select options"), Line::raw("v               Cycle Interactive, Reader, Compact views"), Line::raw("Shift+Enter     Open a selected link in a new tab"), Line::raw("Alt+Enter       Open a selected link in system browser"), Line::raw("Ctrl+L          Focus the address bar"), Line::raw("Ctrl+T / Ctrl+W New tab / close tab"), Line::raw("Ctrl+Tab        Next tab; Ctrl+Shift+Tab previous tab"), Line::raw("h               Home (site root)"), Line::raw("[ / ]           Back / forward; r reloads"), Line::raw("Ctrl+Q          Quit"), Line::raw("Mouse           Click fields and controls; wheel to scroll"), Line::raw("POST submissions ask for confirmation"), Line::raw(""), Line::styled("Esc: close this panel", theme.muted)];
                 frame.render_widget(Clear, popup);
                 frame.render_widget(Paragraph::new(Text::from(help)).block(Block::default().title(" Help ").borders(Borders::ALL).border_style(theme.accent).border_set(border_set(self.ascii))).wrap(Wrap { trim: true }), popup);
             } else if matches!(state.dialog, Some(Dialog::ConfirmSubmit { .. })) {
@@ -1351,6 +1443,27 @@ fn visible_window<T>(items: &[T], start: usize, count: usize) -> &[T] {
     let start = start.min(items.len());
     let end = start.saturating_add(count).min(items.len());
     &items[start..end]
+}
+
+fn presentation_mode_label(mode: PresentationMode) -> &'static str {
+    match mode {
+        PresentationMode::Interactive => "Interactive",
+        PresentationMode::Reader => "Reader",
+        PresentationMode::Compact => "Compact",
+    }
+}
+
+fn component_has_dialog(component: &crate::transform::Component) -> bool {
+    matches!(component.kind, ComponentKind::Dialog { .. })
+        || component.children.iter().any(component_has_dialog)
+}
+
+fn component_contains_modal_dialog(component: &crate::transform::Component) -> bool {
+    matches!(component.kind, ComponentKind::Dialog { modal: true, .. })
+        || component
+            .children
+            .iter()
+            .any(component_contains_modal_dialog)
 }
 
 fn begin_navigation(
@@ -1704,9 +1817,30 @@ fn open_external(url: &str) -> std::io::Result<()> {
     command.spawn().map(|_| ())
 }
 
-fn interactive_targets(page: &TuiPage) -> Vec<InteractiveTarget> {
+fn interactive_targets(page: &TuiPage, mode: PresentationMode) -> Vec<InteractiveTarget> {
     let root = &page.root;
-    fn collect(component: &crate::transform::Component, out: &mut Vec<InteractiveTarget>) {
+    fn collect(
+        component: &crate::transform::Component,
+        mode: PresentationMode,
+        modal_active: bool,
+        inside_modal: bool,
+        out: &mut Vec<InteractiveTarget>,
+    ) {
+        if modal_active && !inside_modal && !component_contains_modal_dialog(component) {
+            return;
+        }
+        if mode == PresentationMode::Reader
+            && matches!(
+                component.kind,
+                ComponentKind::Navigation { .. }
+                    | ComponentKind::Region {
+                        role: crate::dom::RegionRole::Sidebar,
+                        ..
+                    }
+            )
+        {
+            return;
+        }
         match &component.kind {
             ComponentKind::Link {
                 text,
@@ -1749,14 +1883,43 @@ fn interactive_targets(page: &TuiPage) -> Vec<InteractiveTarget> {
                 form_control: None,
                 form: None,
             }),
+            ComponentKind::Disclosure {
+                interactive_id: Some(id),
+                label,
+                ..
+            } => out.push(InteractiveTarget {
+                id: id.clone(),
+                label: label.clone(),
+                target: None,
+                is_button: true,
+                disabled: false,
+                form_control: None,
+                form: None,
+            }),
             _ => {}
         }
-        for child in &component.children {
-            collect(child, out);
+        let children_visible = match &component.kind {
+            ComponentKind::Disclosure { expanded, .. } => {
+                *expanded || mode == PresentationMode::Reader
+            }
+            _ => true,
+        };
+        let inside_modal =
+            inside_modal || matches!(component.kind, ComponentKind::Dialog { modal: true, .. });
+        if children_visible {
+            for child in &component.children {
+                collect(child, mode, modal_active, inside_modal, out);
+            }
         }
     }
     let mut out = Vec::new();
-    collect(root, &mut out);
+    collect(
+        root,
+        mode,
+        component_contains_modal_dialog(root),
+        false,
+        &mut out,
+    );
     for target in &mut out {
         for form in &page.forms {
             if let Some(control) = form
@@ -2197,8 +2360,8 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserBackend, BrowserInteraction, CancellationToken, Focus, HashMap, HttpClient, Theme,
-        UiAction, UiState, Zeroizing, mpsc, visible_window,
+        BrowserBackend, BrowserInteraction, CancellationToken, Focus, HashMap, HttpClient,
+        PresentationMode, Theme, UiAction, UiState, Zeroizing, mpsc, visible_window,
     };
     use crate::{dom::Document, html, transform::transform};
     use crossterm::event::{
@@ -2382,6 +2545,56 @@ mod tests {
     }
 
     #[test]
+    fn presentation_modes_cycle_and_reader_focus_omits_navigation_and_sidebars() {
+        let document = html::parse(
+            "https://example.com",
+            "<nav><a href='/nav'>Navigation link</a></nav><main><a href='/main'>Main link</a></main><aside><a href='/aside'>Sidebar link</a></aside>",
+        );
+        let mut ui = UiState::new(transform(&document));
+        assert_eq!(ui.targets().len(), 3);
+        ui.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(ui.presentation_mode, PresentationMode::Reader);
+        assert_eq!(ui.targets().len(), 1);
+        ui.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(ui.presentation_mode, PresentationMode::Compact);
+        ui.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(ui.presentation_mode, PresentationMode::Interactive);
+    }
+
+    #[test]
+    fn mouse_click_on_status_mode_cycles_presentation() {
+        let mut ui = state();
+        ui.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 22,
+                modifiers: KeyModifiers::NONE,
+            },
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+        );
+        assert_eq!(ui.presentation_mode, PresentationMode::Reader);
+        assert!(ui.dirty);
+    }
+
+    #[test]
+    fn escape_dismisses_an_open_browser_dialog_and_traps_focus_inside_it() {
+        let document = html::parse(
+            "https://example.com",
+            "<nav><a href='/nav'>Hidden while modal</a></nav><dialog open aria-modal='true'><button>Close</button></dialog>",
+        );
+        let mut ui = UiState::new(transform(&document));
+        ui.browser_backend = Some(std::sync::Arc::new(StubBrowser));
+        ui.tab_mut().chromium_session = true;
+        ui.focus = Focus::Content;
+        assert_eq!(ui.targets().len(), 1);
+        assert_eq!(
+            ui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            UiAction::BrowserInteraction(BrowserInteraction::DismissDialog)
+        );
+    }
+
+    #[test]
     fn ctrl_tab_switches_tabs_and_preserves_each_tabs_selection() {
         let mut ui = state();
         ui.append_new_tab(String::new());
@@ -2519,7 +2732,7 @@ mod tests {
         for ch in "secret".chars() {
             ui.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        let targets = super::interactive_targets(&ui.tab().page);
+        let targets = super::interactive_targets(&ui.tab().page, ui.presentation_mode);
         let rendered = super::render_form_line("[ ] pass [wm-0002]", &targets, ui.tab());
         assert!(rendered.contains("••••••"));
         assert!(!rendered.contains("secret"));

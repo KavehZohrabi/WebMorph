@@ -7,7 +7,7 @@ use std::{
 
 use crate::dom::{
     ContentBlock, ContentKind, ContentNode, Document, FormControl, FormDefinition,
-    InteractiveElement, InteractiveKind,
+    InteractiveElement, InteractiveKind, RegionRole,
 };
 
 const IGNORED: &[&str] = &[
@@ -82,7 +82,23 @@ fn walk_children(
     document: &mut Document,
     ordinal: &mut usize,
 ) -> Vec<ContentNode> {
+    walk_children_except(parent, base, document, ordinal, None)
+}
+
+fn walk_children_except(
+    parent: ElementRef<'_>,
+    base: Option<&Url>,
+    document: &mut Document,
+    ordinal: &mut usize,
+    skip_tag: Option<&str>,
+) -> Vec<ContentNode> {
     let mut out = Vec::new();
+    let repeated_articles = parent
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter(|element| element.value().name() == "article")
+        .count()
+        > 1;
     for child in parent.children() {
         if let Some(text) = child.value().as_text() {
             let value = normalize(text);
@@ -93,9 +109,17 @@ fn walk_children(
                 });
             }
         } else if let Some(element) = ElementRef::wrap(child)
+            && Some(element.value().name()) != skip_tag
             && let Some(node) = parse_element(element, base, document, ordinal)
         {
-            out.push(node);
+            if repeated_articles && element.value().name() == "article" {
+                out.push(ContentNode {
+                    kind: ContentKind::RepeatedItem,
+                    children: vec![node],
+                });
+            } else {
+                out.push(node);
+            }
         }
     }
     out
@@ -147,6 +171,42 @@ fn parse_element(
             browser_key(element),
         );
         return leaf(ContentKind::Button { interactive_id: id });
+    }
+    let role = element.value().attr("role");
+    if role == Some("main") && tag != "main" {
+        return Some(ContentNode {
+            kind: ContentKind::Region {
+                role: RegionRole::Main,
+                label: element.value().attr("aria-label").map(str::to_owned),
+            },
+            children: walk_children(element, base, document, ordinal),
+        });
+    }
+    if role == Some("complementary") && tag != "aside" {
+        return Some(ContentNode {
+            kind: ContentKind::Region {
+                role: RegionRole::Sidebar,
+                label: element.value().attr("aria-label").map(str::to_owned),
+            },
+            children: walk_children(element, base, document, ordinal),
+        });
+    }
+    if matches!(role, Some("navigation" | "menu")) && tag != "nav" && tag != "menu" {
+        return Some(ContentNode {
+            kind: ContentKind::Navigation {
+                label: element.value().attr("aria-label").map(str::to_owned),
+            },
+            children: walk_children(element, base, document, ordinal),
+        });
+    }
+    if role == Some("dialog") && tag != "dialog" {
+        return Some(ContentNode {
+            kind: ContentKind::Dialog {
+                label: element.value().attr("aria-label").map(str::to_owned),
+                modal: element.value().attr("aria-modal") == Some("true"),
+            },
+            children: walk_children(element, base, document, ordinal),
+        });
     }
     match tag {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => leaf(ContentKind::Heading {
@@ -229,9 +289,12 @@ fn parse_element(
             kind: ContentKind::TableRow,
             children: walk_children(element, base, document, ordinal),
         }),
-        "th" | "td" => leaf(ContentKind::TableCell {
-            header: tag == "th",
-            text: text_of(element),
+        "th" | "td" => Some(ContentNode {
+            kind: ContentKind::TableCell {
+                header: tag == "th",
+                text: text_of(element),
+            },
+            children: walk_children(element, base, document, ordinal),
         }),
         "form" => Some(ContentNode {
             kind: ContentKind::Form {
@@ -312,6 +375,83 @@ fn parse_element(
             },
             children: walk_children(element, base, document, ordinal),
         }),
+        "main" if element.value().attr("role") == Some("main") || tag == "main" => {
+            Some(ContentNode {
+                kind: ContentKind::Region {
+                    role: RegionRole::Main,
+                    label: element.value().attr("aria-label").map(str::to_owned),
+                },
+                children: walk_children(element, base, document, ordinal),
+            })
+        }
+        "aside"
+            if element
+                .value()
+                .attr("role")
+                .is_none_or(|role| role == "complementary") =>
+        {
+            Some(ContentNode {
+                kind: ContentKind::Region {
+                    role: RegionRole::Sidebar,
+                    label: element.value().attr("aria-label").map(str::to_owned),
+                },
+                children: walk_children(element, base, document, ordinal),
+            })
+        }
+        "details" => {
+            let summary = element
+                .children()
+                .filter_map(ElementRef::wrap)
+                .find(|child| child.value().name() == "summary");
+            let label = summary.map(text_of).unwrap_or_else(|| "Details".into());
+            let interactive_id = summary.and_then(|summary| {
+                browser_key(summary).map(|key| {
+                    add_interactive(
+                        document,
+                        ordinal,
+                        InteractiveKind::Button,
+                        label.clone(),
+                        None,
+                        None,
+                        Some("disclosure".into()),
+                        None,
+                        None,
+                        None,
+                        false,
+                        Some(key),
+                    )
+                })
+            });
+            Some(ContentNode {
+                kind: ContentKind::Disclosure {
+                    interactive_id,
+                    label,
+                    expanded: element.value().attr("open").is_some(),
+                },
+                children: walk_children_except(element, base, document, ordinal, Some("summary")),
+            })
+        }
+        "dialog" => {
+            element.value().attr("open")?;
+            Some(ContentNode {
+                kind: ContentKind::Dialog {
+                    label: element.value().attr("aria-label").map(str::to_owned),
+                    modal: element.value().attr("aria-modal") == Some("true"),
+                },
+                children: walk_children(element, base, document, ordinal),
+            })
+        }
+        "menu" => Some(ContentNode {
+            kind: ContentKind::Navigation {
+                label: element
+                    .value()
+                    .attr("aria-label")
+                    .or(Some("Menu"))
+                    .or_else(|| (role == Some("menu")).then_some("Menu"))
+                    .map(str::to_owned),
+            },
+            children: walk_children(element, base, document, ordinal),
+        }),
         "iframe" | "canvas" | "video" | "audio" | "object" | "embed" => {
             document.unsupported_elements.push(tag.to_owned());
             leaf(ContentKind::Fallback {
@@ -319,10 +459,9 @@ fn parse_element(
                 text: text_of(element),
             })
         }
-        "html" | "body" | "main" | "article" | "section" | "header" | "footer" | "aside"
-        | "div" | "span" | "strong" | "em" | "b" | "i" | "label" | "fieldset" | "legend"
-        | "option" | "datalist" | "details" | "summary" | "blockquote" | "figure"
-        | "figcaption" | "br" | "hr" => {
+        "html" | "body" | "article" | "section" | "header" | "footer" | "div" | "span"
+        | "strong" | "em" | "b" | "i" | "label" | "fieldset" | "legend" | "option" | "datalist"
+        | "summary" | "blockquote" | "figure" | "figcaption" | "br" | "hr" => {
             let children = walk_children(element, base, document, ordinal);
             if children.is_empty() {
                 None
@@ -687,6 +826,16 @@ mod tests {
         assert!(kinds.iter().any(|k| matches!(k, ContentKind::Image { alt, src: Some(src), .. } if alt == "Portrait" && src == "https://example.com/root/photo.png")));
         assert_eq!(doc.interactive.len(), 3);
         assert!(doc.interactive.iter().all(|i| i.id.starts_with("wm-")));
+    }
+
+    #[test]
+    fn marks_sibling_articles_as_repeated_content() {
+        let doc = parse(
+            "https://example.test/",
+            "<main><article><h2>One</h2></article><article><h2>Two</h2></article></main>",
+        );
+        assert_eq!(doc.content[0].children[0].kind, ContentKind::RepeatedItem);
+        assert_eq!(doc.content[0].children[1].kind, ContentKind::RepeatedItem);
     }
 
     #[test]

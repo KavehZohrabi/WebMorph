@@ -10,9 +10,11 @@ interaction; it is not a full browser.
 - Lightweight HTTP/HTTPS engine is the default, with request timeouts, response
   limits, compressed-response support, redirect checks, and cancellation.
 - Terminal interface with multiple tabs, independent navigation history,
-  scrolling, address entry, and explicit external-browser opening.
+  scrolling, address entry, reader/interactive/compact presentation modes, and
+  explicit external-browser opening.
 - HTML extraction for headings, paragraphs, links, lists, tables, images,
-  navigation, and common form controls.
+  navigation landmarks, main/sidebar regions, repeated article items, open
+  dialogs, disclosures, and common form controls.
 - Basic GET and URL-encoded POST forms, with practical HTML validation and a
   confirmation before submitting forms. GET forms containing password fields
   are refused so passwords cannot be exposed in URLs or browsing history.
@@ -103,6 +105,7 @@ Options:
 | `Ctrl+Tab`, `Ctrl+Shift+Tab` | Next or previous tab |
 | `h`, `[` / `]`, `r` | With page focus: site root, back/forward, reload |
 | `t` | With page focus, cycle automatic, dark, and light themes for the current session |
+| `v` | With page focus, cycle Interactive, Reader, and Compact presentation modes |
 | `?` or `F1` | Show help |
 | `q` (outside text entry), `Ctrl+Q` | Quit |
 | `Esc` | Dismiss a dialog, cancel a pending request, or leave the address bar/field editor |
@@ -110,6 +113,11 @@ Options:
 Mouse clicks select visible controls and links. The wheel scrolls the page.
 Terminal key handling varies by emulator; keyboard alternatives remain
 available for core interactions.
+
+Interactive mode shows the page structure and available controls. Reader mode
+hides navigation and sidebars and opens disclosure sections for reading.
+Compact mode reduces spacing and stacks tables for narrow layouts. Click the
+mode label in the status row to cycle views with a mouse.
 
 ## Configuration and privacy
 
@@ -164,6 +172,13 @@ remain important.
   yet exposed as interactive application screens.
 - Compatibility depends on the terminal's Unicode, mouse, and key-event
   support. No claim is made that all sites or terminals work identically.
+- Large documents are rendered from a bounded scrolling window. Layout still
+  walks the component tree when that window moves outside the cached range, so
+  exceptionally large, deeply nested pages can take longer to scroll.
+- Lightweight mode cannot expand a `<details>` section because it does not run
+  page scripts; such controls are labeled as requiring Chromium. Interactive
+  disclosure and dialog actions are available only when Chromium supplies a
+  browser-backed element mapping.
 
 ## Contributing
 
