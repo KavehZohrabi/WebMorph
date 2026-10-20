@@ -7,6 +7,7 @@ const root = path.resolve(__dirname, '../..');
 const cargo = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
 const rustVersion = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 if (!rustVersion) throw new Error('Could not read the Rust package version from Cargo.toml.');
+const npmScope = '@kavehzohrabi';
 
 const manifests = [
   ['main npm package', path.join(root, 'package.json')],
@@ -16,7 +17,11 @@ const manifests = [
   ]),
 ];
 const platformNames = manifests.slice(1).map(([, file]) => JSON.parse(fs.readFileSync(file, 'utf8')).name).sort();
-const declaredOptionalNames = Object.keys(JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).optionalDependencies || {}).sort();
+const mainManifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+if (mainManifest.name !== `${npmScope}/webmorph`) {
+  throw new Error(`Main npm package must be named ${npmScope}/webmorph.`);
+}
+const declaredOptionalNames = Object.keys(mainManifest.optionalDependencies || {}).sort();
 if (JSON.stringify(platformNames) !== JSON.stringify(declaredOptionalNames)) {
   throw new Error('Main package optionalDependencies do not match the available platform package manifests.');
 }
@@ -36,8 +41,9 @@ for (const [label, file] of manifests) {
       throw new Error(`${label} must declare exactly one supported operating system and CPU architecture.`);
     }
     const targetName = path.basename(path.dirname(file));
-    if (!manifest.name.endsWith(`-${targetName}`)) {
-      throw new Error(`${label} package name does not match its ${targetName} directory.`);
+    const expectedName = `${npmScope}/webmorph-${targetName}`;
+    if (manifest.name !== expectedName) {
+      throw new Error(`${label} must be named ${expectedName} to match its ${targetName} directory and release scope.`);
     }
   }
 }

@@ -6,12 +6,12 @@ const { binaryFor, platformPackage } = require('../bin/webmorph.js');
 
 test('maps all advertised operating system and architecture pairs', () => {
   const expected = [
-    ['linux', 'x64', '@kaveh-zohrabi/webmorph-linux-x64'],
-    ['linux', 'arm64', '@kaveh-zohrabi/webmorph-linux-arm64'],
-    ['win32', 'x64', '@kaveh-zohrabi/webmorph-win32-x64'],
-    ['win32', 'arm64', '@kaveh-zohrabi/webmorph-win32-arm64'],
-    ['darwin', 'x64', '@kaveh-zohrabi/webmorph-darwin-x64'],
-    ['darwin', 'arm64', '@kaveh-zohrabi/webmorph-darwin-arm64'],
+    ['linux', 'x64', '@kavehzohrabi/webmorph-linux-x64'],
+    ['linux', 'arm64', '@kavehzohrabi/webmorph-linux-arm64'],
+    ['win32', 'x64', '@kavehzohrabi/webmorph-win32-x64'],
+    ['win32', 'arm64', '@kavehzohrabi/webmorph-win32-arm64'],
+    ['darwin', 'x64', '@kavehzohrabi/webmorph-darwin-x64'],
+    ['darwin', 'arm64', '@kavehzohrabi/webmorph-darwin-arm64'],
   ];
   for (const [platform, arch, packageName] of expected) {
     assert.equal(platformPackage(platform, arch), packageName);
@@ -43,5 +43,5 @@ test('selects the platform executable path', () => {
     return 'C:\\node_modules\\webmorph.exe';
   });
   assert.equal(result, 'C:\\node_modules\\webmorph.exe');
-  assert.deepEqual(requests, ['@kaveh-zohrabi/webmorph-win32-arm64/bin/webmorph.exe']);
+  assert.deepEqual(requests, ['@kavehzohrabi/webmorph-win32-arm64/bin/webmorph.exe']);
 });

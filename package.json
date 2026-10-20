@@ -1,5 +1,5 @@
 {
-  "name": "@kaveh-zohrabi/webmorph",
+  "name": "@kavehzohrabi/webmorph",
   "version": "0.1.0",
   "description": "Transform websites into interactive terminal user interfaces",
   "license": "MIT",
@@ -24,12 +24,12 @@
     "bin/webmorph.js"
   ],
   "optionalDependencies": {
-    "@kaveh-zohrabi/webmorph-linux-x64": "0.1.0",
-    "@kaveh-zohrabi/webmorph-linux-arm64": "0.1.0",
-    "@kaveh-zohrabi/webmorph-win32-x64": "0.1.0",
-    "@kaveh-zohrabi/webmorph-win32-arm64": "0.1.0",
-    "@kaveh-zohrabi/webmorph-darwin-x64": "0.1.0",
-    "@kaveh-zohrabi/webmorph-darwin-arm64": "0.1.0"
+    "@kavehzohrabi/webmorph-linux-x64": "0.1.0",
+    "@kavehzohrabi/webmorph-linux-arm64": "0.1.0",
+    "@kavehzohrabi/webmorph-win32-x64": "0.1.0",
+    "@kavehzohrabi/webmorph-win32-arm64": "0.1.0",
+    "@kavehzohrabi/webmorph-darwin-x64": "0.1.0",
+    "@kavehzohrabi/webmorph-darwin-arm64": "0.1.0"
   },
   "scripts": {
     "test": "node --test"

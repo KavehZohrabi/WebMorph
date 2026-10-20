@@ -114,7 +114,7 @@ jobs:
           NPM_RELEASE_READY: ${{ vars.NPM_RELEASE_READY }}
         run: |
           if [ "$NPM_RELEASE_READY" != "true" ]; then
-            echo "Release blocked: verify ownership of @kaveh-zohrabi, configure npm Trusted Publishers for all seven packages and this workflow/environment, then set repository variable NPM_RELEASE_READY=true." >&2
+            echo "Release blocked: verify ownership of @kavehzohrabi, configure npm Trusted Publishers for all seven packages and this workflow/environment, then set repository variable NPM_RELEASE_READY=true." >&2
             exit 1
           fi
 
@@ -159,7 +159,7 @@ jobs:
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
           for package in linux-x64 linux-arm64 win32-x64 win32-arm64 darwin-x64 darwin-arm64; do
-            archive="release-packages/kaveh-zohrabi-webmorph-${package}-${version}.tgz"
+            archive="release-packages/kavehzohrabi-webmorph-${package}-${version}.tgz"
             if [ ! -f "$archive" ]; then
               echo "Missing required platform package archive: $archive" >&2
               exit 1
@@ -169,4 +169,4 @@ jobs:
       - name: Publish main npm package last
         run: |
           version="$(node -p "require('./package.json').version")"
-          npm publish "release-packages/kaveh-zohrabi-webmorph-${version}.tgz" --access public --provenance
+          npm publish "release-packages/kavehzohrabi-webmorph-${version}.tgz" --access public --provenance

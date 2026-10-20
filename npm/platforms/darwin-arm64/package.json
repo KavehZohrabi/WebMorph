@@ -1,5 +1,5 @@
 {
-  "name": "@kaveh-zohrabi/webmorph-darwin-arm64",
+  "name": "@kavehzohrabi/webmorph-darwin-arm64",
   "version": "0.1.0",
   "description": "WebMorph native executable for darwin/arm64",
   "license": "MIT",

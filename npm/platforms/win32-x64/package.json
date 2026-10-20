@@ -1,5 +1,5 @@
 {
-  "name": "@kaveh-zohrabi/webmorph-win32-x64",
+  "name": "@kavehzohrabi/webmorph-win32-x64",
   "version": "0.1.0",
   "description": "WebMorph native executable for win32/x64",
   "license": "MIT",

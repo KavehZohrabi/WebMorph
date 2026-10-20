@@ -7,7 +7,7 @@ const [platform, executablePath] = process.argv.slice(2);
 if (!platform || !executablePath) {
   throw new Error('Usage: node npm/scripts/install-local-binary.cjs <platform> <executable>');
 }
-const packageName = `@kaveh-zohrabi/webmorph-${platform}`;
+const packageName = `@kavehzohrabi/webmorph-${platform}`;
 const destination = path.join(process.cwd(), 'node_modules', ...packageName.split('/'), 'bin');
 fs.mkdirSync(destination, { recursive: true });
 const filename = platform.startsWith('win32-') ? 'webmorph.exe' : 'webmorph';

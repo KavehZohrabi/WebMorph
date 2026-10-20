@@ -54,7 +54,7 @@ The workflow requests only `contents: read` and `id-token: write` for the
 publish job. It uses npm Trusted Publishing and provenance, not a long-lived
 token. Before the first release, an npm maintainer must:
 
-1. Confirm they control the `@kaveh-zohrabi` npm scope and can publish public
+1. Confirm they control the `@kavehzohrabi` npm scope and can publish public
    packages in it.
 2. Configure Trusted Publisher records for the repository and the exact
    workflow file `.github/workflows/npm-release.yml` on the main and each of
@@ -70,7 +70,7 @@ token. Before the first release, an npm maintainer must:
    version tag to request publication.
 
 The npm registry returned 404 for both `webmorph` and
-`@kaveh-zohrabi/webmorph` during implementation. A 404 means the exact package
+`@kavehzohrabi/webmorph` during implementation. A 404 means the exact package
 version/name is not currently present in the public registry; it does not
 prove ownership of the npm scope. No npm publisher identity was authenticated
 in the implementation environment, so scope ownership and OIDC authorization
@@ -81,7 +81,7 @@ remain release setup gates.
 - **Unsupported operating system/architecture:** use a listed target or build
   the Rust project from source with Cargo.
 - **Native package missing:** rerun `npm install --global
-  @kaveh-zohrabi/webmorph` on the target machine and check that optional npm
+  @kavehzohrabi/webmorph` on the target machine and check that optional npm
   dependencies were not disabled with `--omit=optional` or `--no-optional`.
 - **`spawn` or permission error:** reinstall the package. On Unix-like systems,
   the release package marks its executable as executable; avoid extracting the

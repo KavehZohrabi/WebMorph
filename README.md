@@ -33,7 +33,7 @@ After the npm packages are published, install the platform-matched native
 binary and the small Node.js launcher globally:
 
 ```sh
-npm install --global @kaveh-zohrabi/webmorph
+npm install --global @kavehzohrabi/webmorph
 webmorph https://example.com
 ```
 
@@ -46,7 +46,7 @@ inherits terminal input/output for the TUI. Node.js 18 or newer is required.
 
 If an architecture package is missing, install from the source checkout using
 the Cargo instructions below. The `webmorph` npm name was unavailable when the
-package was checked, so this distribution uses the `@kaveh-zohrabi/webmorph`
+package was checked, so this distribution uses the `@kavehzohrabi/webmorph`
 scope. npm scope ownership and Trusted Publisher authorization must be
 confirmed before the first release.
 
@@ -236,7 +236,7 @@ atomic: the workflow stops before publishing the main package and requires
 manual recovery of already-published platform versions before retrying.
 
 Before enabling a tagged release, an npm maintainer must own the
-`@kaveh-zohrabi` scope, create public Trusted Publisher entries for this
+`@kavehzohrabi` scope, create public Trusted Publisher entries for this
 repository and `.github/workflows/npm-release.yml` (including the `npm-release`
 environment), configure any required environment protection in GitHub, and set
 the `NPM_RELEASE_READY=true` repository Actions variable after verification.
