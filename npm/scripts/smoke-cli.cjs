@@ -9,7 +9,7 @@ const expectedVersion = `webmorph ${require('../../package.json').version}`;
 
 for (const [flag, expected] of [
   ['--version', expectedVersion],
-  ['--help', 'Usage: webmorph [OPTIONS] [URL]'],
+  ['--help', /^Usage: webmorph(?:\.exe)? \[OPTIONS\] \[URL\]/m],
 ]) {
   const result = spawnSync(process.execPath, [launcher, flag], {
     encoding: 'utf8',
@@ -18,6 +18,9 @@ for (const [flag, expected] of [
   });
   assert.ifError(result.error);
   assert.equal(result.status, 0, `${flag} exited ${result.status}: ${result.stderr}`);
-  assert.ok(result.stdout.includes(expected), `${flag} output did not include ${JSON.stringify(expected)}: ${result.stdout}`);
+  const outputMatched = typeof expected === 'string'
+    ? result.stdout.includes(expected)
+    : expected.test(result.stdout);
+  assert.ok(outputMatched, `${flag} output did not include ${expected}: ${result.stdout}`);
   process.stdout.write(`${flag} passed through the npm launcher.\n`);
 }
