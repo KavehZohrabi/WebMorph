@@ -19,6 +19,7 @@ if (!fs.existsSync(path.join(template, 'package.json'))) {
 }
 fs.rmSync(destination, { recursive: true, force: true });
 fs.mkdirSync(path.join(destination, 'bin'), { recursive: true });
+fs.mkdirSync(path.resolve('target/npm-tarballs'), { recursive: true });
 fs.copyFileSync(path.join(template, 'package.json'), path.join(destination, 'package.json'));
 fs.copyFileSync(path.join(root, 'LICENSE'), path.join(destination, 'LICENSE'));
 const filename = platform.startsWith('win32-') ? 'webmorph.exe' : 'webmorph';

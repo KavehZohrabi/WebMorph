@@ -747,11 +747,6 @@ fn resident_set_bytes() -> Option<u64> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
-fn rss_delta_kib(_before: Option<u64>, _after: Option<u64>) -> Option<i64> {
-    None
-}
-
 fn parse_args() -> (Option<PathBuf>, bool) {
     let mut output = None;
     let mut live = false;
