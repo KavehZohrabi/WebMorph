@@ -45,6 +45,10 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "lightweight")]
     pub engine: EngineChoice,
 
+    /// Try Chromium only for likely JavaScript application shells (requires browser-engine)
+    #[arg(long)]
+    pub fallback_chromium: bool,
+
     /// Set log verbosity (overridden by RUST_LOG when present)
     #[arg(short, long, value_enum, default_value = "warn")]
     pub verbosity: Verbosity,

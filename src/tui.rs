@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::{
-    browser::BrowserBackend,
+    browser::{BrowserBackend, BrowserInteraction},
     dom::{Document, FormControl, FormDefinition},
     error::{Result, WebMorphError},
     html,
@@ -83,6 +83,7 @@ struct BrowserTab {
     request_id: u64,
     form_values: FormValues,
     layout_cache: Option<(usize, u64, Vec<String>)>,
+    chromium_session: bool,
 }
 
 struct NavigationPayload {
@@ -120,6 +121,7 @@ enum UiAction {
         form_id: String,
         submitter: Option<String>,
     },
+    BrowserInteraction(BrowserInteraction),
 }
 
 struct UiState {
@@ -138,6 +140,7 @@ struct UiState {
     dirty: bool,
     editing_field: Option<String>,
     browser_backend: Option<Arc<dyn BrowserBackend>>,
+    fallback_browser_backend: Option<Arc<dyn BrowserBackend>>,
 }
 
 impl UiState {
@@ -165,6 +168,7 @@ impl UiState {
             request_id: 0,
             form_values,
             layout_cache: None,
+            chromium_session: false,
         };
         Self {
             tabs: vec![tab],
@@ -182,6 +186,7 @@ impl UiState {
             dirty: true,
             editing_field: None,
             browser_backend: None,
+            fallback_browser_backend: None,
         }
     }
 
@@ -190,6 +195,15 @@ impl UiState {
     }
     fn tab_mut(&mut self) -> &mut BrowserTab {
         &mut self.tabs[self.active_tab]
+    }
+
+    fn active_browser(&self) -> Option<Arc<dyn BrowserBackend>> {
+        if !self.tab().chromium_session {
+            return None;
+        }
+        self.browser_backend
+            .clone()
+            .or_else(|| self.fallback_browser_backend.clone())
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
@@ -249,9 +263,17 @@ impl UiState {
             return UiAction::None;
         }
         if key.code == KeyCode::Esc {
-            if self.editing_field.take().is_some() {
+            if let Some(id) = self.editing_field.take() {
                 self.status = "Field editing finished".into();
                 self.dirty = true;
+                if self.active_browser().is_some()
+                    && let Some(value) = self.tab().form_values.get(&id)
+                {
+                    return UiAction::BrowserInteraction(BrowserInteraction::SetValue {
+                        interactive_id: id,
+                        value: value.to_string(),
+                    });
+                }
                 return UiAction::None;
             }
             if self.tab().loading {
@@ -263,9 +285,18 @@ impl UiState {
             return UiAction::None;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.editing_field = None;
+            let editing_field = self.editing_field.take();
             self.move_focus(key.code != KeyCode::BackTab && !shift);
             self.dirty = true;
+            if self.active_browser().is_some()
+                && let Some(id) = editing_field
+                && let Some(value) = self.tab().form_values.get(&id)
+            {
+                return UiAction::BrowserInteraction(BrowserInteraction::SetValue {
+                    interactive_id: id,
+                    value: value.to_string(),
+                });
+            }
             return UiAction::None;
         }
         if self.focus == Focus::Address {
@@ -273,16 +304,25 @@ impl UiState {
         }
         if let Some(id) = self.editing_field.clone() {
             self.edit_form_field(&id, key);
+            if key.code == KeyCode::Enter
+                && self.active_browser().is_some()
+                && let Some(value) = self.tab().form_values.get(&id)
+            {
+                return UiAction::BrowserInteraction(BrowserInteraction::SetValue {
+                    interactive_id: id,
+                    value: value.to_string(),
+                });
+            }
             return UiAction::None;
         }
         if let Some(control) = self.selected_select() {
             if key.code == KeyCode::Up {
                 self.cycle_select(&control, -1);
-                return UiAction::None;
+                return self.sync_select(control.interactive_id);
             }
             if key.code == KeyCode::Down {
                 self.cycle_select(&control, 1);
-                return UiAction::None;
+                return self.sync_select(control.interactive_id);
             }
         }
         match key.code {
@@ -326,6 +366,24 @@ impl UiState {
                 self.tab_mut().scroll = self.tab().page.lines.len();
                 self.dirty = true;
                 UiAction::None
+            }
+            KeyCode::PageDown => {
+                self.tab_mut().scroll = self.tab().scroll.saturating_add(10);
+                self.dirty = true;
+                if self.active_browser().is_some() {
+                    UiAction::BrowserInteraction(BrowserInteraction::Scroll { delta: 600 })
+                } else {
+                    UiAction::None
+                }
+            }
+            KeyCode::PageUp => {
+                self.tab_mut().scroll = self.tab().scroll.saturating_sub(10);
+                self.dirty = true;
+                if self.active_browser().is_some() {
+                    UiAction::BrowserInteraction(BrowserInteraction::Scroll { delta: -600 })
+                } else {
+                    UiAction::None
+                }
             }
             KeyCode::Char('t') => {
                 self.theme = match self.theme {
@@ -413,6 +471,19 @@ impl UiState {
             return UiAction::None;
         }
         if let Some(url) = &target.target {
+            let same_browser_origin = HttpClient::parse_url(url)
+                .ok()
+                .zip(HttpClient::parse_url(&self.tab().url).ok())
+                .is_some_and(|(target, current)| {
+                    target.scheme() == current.scheme()
+                        && target.host_str() == current.host_str()
+                        && target.port_or_known_default() == current.port_or_known_default()
+                });
+            if self.active_browser().is_some() && !open_new_tab && same_browser_origin {
+                return UiAction::BrowserInteraction(BrowserInteraction::Click {
+                    interactive_id: target.id,
+                });
+            }
             self.address = url.clone();
             self.address_cursor = self.address.chars().count();
             if open_new_tab {
@@ -434,7 +505,13 @@ impl UiState {
                         .form_values
                         .insert(control.interactive_id.clone(), Zeroizing::new(toggled));
                     self.dirty = true;
-                    UiAction::None
+                    if self.active_browser().is_some() {
+                        UiAction::BrowserInteraction(BrowserInteraction::Click {
+                            interactive_id: control.interactive_id,
+                        })
+                    } else {
+                        UiAction::None
+                    }
                 }
                 "radio" => {
                     if let (Some(form), Some(name)) = (&target.form, &control.name) {
@@ -452,7 +529,13 @@ impl UiState {
                         Zeroizing::new("true".into()),
                     );
                     self.dirty = true;
-                    UiAction::None
+                    if self.active_browser().is_some() {
+                        UiAction::BrowserInteraction(BrowserInteraction::Click {
+                            interactive_id: control.interactive_id,
+                        })
+                    } else {
+                        UiAction::None
+                    }
                 }
                 "select" => {
                     if control.multiple {
@@ -462,7 +545,7 @@ impl UiState {
                         return UiAction::None;
                     }
                     self.cycle_select(&control, 1);
-                    UiAction::None
+                    self.sync_select(control.interactive_id)
                 }
                 "file" => {
                     self.status = "File uploads are not supported".into();
@@ -473,6 +556,11 @@ impl UiState {
                     self.request_form_submit(&target, Some(control.interactive_id))
                 }
                 "reset" => {
+                    if self.active_browser().is_some() {
+                        return UiAction::BrowserInteraction(BrowserInteraction::Click {
+                            interactive_id: control.interactive_id,
+                        });
+                    }
                     if let Some(form) = &target.form {
                         for field in &form.controls {
                             let default = if field.control_type == "password" {
@@ -489,9 +577,15 @@ impl UiState {
                     UiAction::None
                 }
                 "button" => {
-                    self.status = "JavaScript-driven buttons are not supported".into();
-                    self.dirty = true;
-                    UiAction::None
+                    if self.active_browser().is_some() {
+                        UiAction::BrowserInteraction(BrowserInteraction::Click {
+                            interactive_id: control.interactive_id,
+                        })
+                    } else {
+                        self.status = "JavaScript-driven buttons are not supported".into();
+                        self.dirty = true;
+                        UiAction::None
+                    }
                 }
                 _ => {
                     self.editing_field = Some(control.interactive_id.clone());
@@ -501,9 +595,15 @@ impl UiState {
                 }
             }
         } else if target.is_button {
-            self.status = "JavaScript-driven buttons are not supported".into();
-            self.dirty = true;
-            UiAction::None
+            if self.active_browser().is_some() {
+                UiAction::BrowserInteraction(BrowserInteraction::Click {
+                    interactive_id: target.id,
+                })
+            } else {
+                self.status = "JavaScript-driven buttons are not supported".into();
+                self.dirty = true;
+                UiAction::None
+            }
         } else {
             self.status = format!("Selected {}", target.label);
             self.dirty = true;
@@ -516,12 +616,15 @@ impl UiState {
         target: &InteractiveTarget,
         submitter: Option<String>,
     ) -> UiAction {
-        let Some(form) = &target.form else {
+        let Some(mut form) = target.form.clone() else {
             self.status = "This control is not associated with a supported form".into();
             self.dirty = true;
             return UiAction::None;
         };
-        if let Some(error) = validate_form(form, &self.tab().form_values) {
+        if self.active_browser().is_some() {
+            form.requires_javascript = false;
+        }
+        if let Some(error) = validate_form(&form, &self.tab().form_values) {
             self.status = error;
             self.dirty = true;
             return UiAction::None;
@@ -575,7 +678,7 @@ impl UiState {
             .get(id)
             .cloned()
             .unwrap_or_else(|| Zeroizing::new(String::new()));
-        if key.code == KeyCode::Enter
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc)
             && control.control_type == "textarea"
             && key.modifiers.contains(KeyModifiers::SHIFT)
         {
@@ -644,6 +747,22 @@ impl UiState {
         );
         self.status = format!("{}: {}", control.label, control.options[next].1);
         self.dirty = true;
+    }
+
+    fn sync_select(&self, interactive_id: String) -> UiAction {
+        if self.browser_backend.is_none() {
+            return UiAction::None;
+        }
+        let value = self
+            .tab()
+            .form_values
+            .get(&interactive_id)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        UiAction::BrowserInteraction(BrowserInteraction::SelectOption {
+            interactive_id,
+            value,
+        })
     }
 
     fn external_target(&mut self) -> UiAction {
@@ -728,6 +847,7 @@ impl UiState {
             request_id: 0,
             form_values,
             layout_cache: None,
+            chromium_session: self.browser_backend.is_some(),
         });
         self.active_tab = self.tabs.len() - 1;
         self.address.clear();
@@ -748,10 +868,18 @@ impl UiState {
             MouseEventKind::ScrollDown => {
                 self.tab_mut().scroll = self.tab().scroll.saturating_add(3);
                 self.dirty = true;
+                if self.active_browser().is_some() {
+                    return UiAction::BrowserInteraction(BrowserInteraction::Scroll { delta: 360 });
+                }
             }
             MouseEventKind::ScrollUp => {
                 self.tab_mut().scroll = self.tab().scroll.saturating_sub(3);
                 self.dirty = true;
+                if self.active_browser().is_some() {
+                    return UiAction::BrowserInteraction(BrowserInteraction::Scroll {
+                        delta: -360,
+                    });
+                }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let y = mouse.row.saturating_sub(area.y);
@@ -818,6 +946,13 @@ impl UiState {
                             self.selected_interactive = index;
                             if !target.disabled {
                                 if let Some(url) = &target.target {
+                                    if self.active_browser().is_some() {
+                                        return UiAction::BrowserInteraction(
+                                            BrowserInteraction::Click {
+                                                interactive_id: target.id.clone(),
+                                            },
+                                        );
+                                    }
                                     return UiAction::Navigate(url.clone());
                                 }
                                 if target.is_button || target.form_control.is_some() {
@@ -853,7 +988,10 @@ struct NavigationResult {
     request_id: u64,
     tab_id: u64,
     history_target: Option<usize>,
-    result: std::result::Result<(TuiPage, String), WebMorphError>,
+    engine_name: &'static str,
+    is_interaction: bool,
+    used_chromium: bool,
+    result: std::result::Result<(TuiPage, String, String), WebMorphError>,
 }
 
 pub struct TerminalSession {
@@ -905,11 +1043,14 @@ impl TerminalSession {
         client: HttpClient,
         storage: Storage,
         browser_backend: Option<Arc<dyn BrowserBackend>>,
+        fallback_browser_backend: Option<Arc<dyn BrowserBackend>>,
     ) -> Result<()> {
         let placeholder = transform(&Document::new(url.clone(), "Loading"));
         let state = UiState::new(placeholder);
         let mut state = state;
         state.browser_backend = browser_backend;
+        state.fallback_browser_backend = fallback_browser_backend;
+        state.tabs[0].chromium_session = state.browser_backend.is_some();
         self.run_state(state, Some((url, client, Some(storage))))
             .await
     }
@@ -970,28 +1111,51 @@ impl TerminalSession {
                             cancellations.remove(&result.tab_id);
                             let is_active = index == state.active_tab;
                             let tab = &mut state.tabs[index]; tab.loading = false; tab.error = None;
+                            if result.result.is_ok() && !result.is_interaction { tab.chromium_session = result.used_chromium; }
                             let status = match result.result {
-                                Ok((page, final_url)) => {
+                                Ok((page, final_url, diagnostic)) => {
                                     if let Some(storage) = storage.as_mut()
                                         && let Err(error) = storage.record_visit(&final_url, &page.title)
                                     {
                                         tracing::warn!(%error, "failed to persist browsing history");
                                     }
-                                    tab.title = page.title.clone(); tab.url = final_url.clone(); tab.form_values = default_form_values(&page.forms); tab.page = page; tab.scroll = 0; tab.layout_cache = None;
-                                    tab.selected_interactive = 0;
+                                    let old_form_values = std::mem::take(&mut tab.form_values);
+                                    tab.title = page.title.clone(); tab.url = final_url.clone(); tab.form_values = default_form_values(&page.forms);
+                                    if result.is_interaction {
+                                        for form in &page.forms {
+                                            for control in &form.controls {
+                                                if control.control_type == "password"
+                                                    && let Some(previous) = old_form_values.get(&control.interactive_id)
+                                                {
+                                                    tab.form_values.insert(control.interactive_id.clone(), previous.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    tab.page = page; tab.scroll = 0; tab.layout_cache = None;
+                                    if !result.is_interaction { tab.selected_interactive = 0; }
                                     if let Some(index) = result.history_target { tab.history_index = index; tab.history[index] = final_url.clone(); }
                                     else { tab.history.truncate(tab.history_index.saturating_add(1)); if tab.history.last() != Some(&final_url) { tab.history.push(final_url.clone()); } tab.history_index = tab.history.len().saturating_sub(1); }
-                                    "Page loaded"
+                                    diagnostic
                                 }
-                                Err(WebMorphError::Cancelled) => "Request cancelled",
-                                Err(error) => { tab.error = Some(error.to_string()); "Unable to load page" }
+                                Err(WebMorphError::Cancelled) => "Request cancelled".to_owned(),
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    if result.is_interaction {
+                                        format!("Chromium interaction failed: {message}")
+                                    } else {
+                                        tab.error = Some(message.clone());
+                                        format!("{} engine failed: {message}", result.engine_name)
+                                    }
+                                }
                             };
                             if is_active {
                                 if let Some(tab) = state.tabs.iter().find(|tab| tab.id == result.tab_id) { state.address = tab.url.clone(); }
-                                if status == "Page loaded" { state.selected_interactive = 0; }
-                                state.status = status.into();
-                                state.focus = if status == "Unable to load page" { Focus::Address } else { Focus::Content };
-                                state.address_replacing = status == "Unable to load page";
+                                if status.starts_with("Loaded") && !result.is_interaction { state.selected_interactive = 0; }
+                                state.status = status.clone();
+                                let failed = status.contains("engine failed:");
+                                state.focus = if failed { Focus::Address } else { Focus::Content };
+                                state.address_replacing = failed;
                             }
                             state.dirty = true;
                     }
@@ -1016,7 +1180,8 @@ impl TerminalSession {
                                     UiAction::NextTab => state.select_tab(1),
                                     UiAction::PreviousTab => state.select_tab(-1),
                                     UiAction::SubmitForm { form_id, submitter } => begin_form_submission(&mut state, &form_id, submitter.as_deref(), HttpClient::default(), &sender, &mut request_id, &mut cancellations),
-                                    UiAction::CloseTab => { if state.tabs.len() > 1 { let removed = state.tabs.remove(state.active_tab); if let Some(token) = cancellations.remove(&removed.id) { token.cancel(); } state.active_tab = state.active_tab.min(state.tabs.len()-1); state.address = state.tab().url.clone(); state.selected_interactive = state.tab().selected_interactive; state.dirty = true; } else { break; } }
+                                    UiAction::BrowserInteraction(interaction) => begin_browser_interaction(&mut state, interaction, &sender, &mut request_id, &mut cancellations),
+                                    UiAction::CloseTab => { if state.tabs.len() > 1 { let removed = state.tabs.remove(state.active_tab); if let Some(token) = cancellations.remove(&removed.id) { token.cancel(); } let backend = if removed.chromium_session { state.browser_backend.clone().or_else(|| state.fallback_browser_backend.clone()) } else { None }; if let Some(browser) = backend { browser.close_session(removed.id).await; } state.active_tab = state.active_tab.min(state.tabs.len()-1); state.address = state.tab().url.clone(); state.selected_interactive = state.tab().selected_interactive; state.dirty = true; } else { break; } }
                                     UiAction::None => {}
                                 }
                             }
@@ -1047,6 +1212,7 @@ impl TerminalSession {
                                     UiAction::NextTab => state.select_tab(1),
                                     UiAction::PreviousTab => state.select_tab(-1),
                                     UiAction::SubmitForm { form_id, submitter } => begin_form_submission(&mut state, &form_id, submitter.as_deref(), HttpClient::default(), &sender, &mut request_id, &mut cancellations),
+                                    UiAction::BrowserInteraction(interaction) => begin_browser_interaction(&mut state, interaction, &sender, &mut request_id, &mut cancellations),
                                     _ => {}
                                 }
                                 state.dirty = true;
@@ -1060,6 +1226,12 @@ impl TerminalSession {
         }
         for token in cancellations.into_values() {
             token.cancel();
+        }
+        if let Some(browser) = &state.browser_backend {
+            browser.close_all().await;
+        }
+        if let Some(browser) = &state.fallback_browser_backend {
+            browser.close_all().await;
         }
         Ok(())
     }
@@ -1228,11 +1400,6 @@ fn begin_navigation_request(
         history_target,
         post_fields,
     } = payload;
-    if post_fields.is_some() && state.browser_backend.is_some() {
-        state.status = "Chromium mode does not support form submission yet".into();
-        state.dirty = true;
-        return;
-    }
     if url.trim().is_empty() {
         state.status = "Enter an HTTP or HTTPS address".into();
         state.dirty = true;
@@ -1273,40 +1440,85 @@ fn begin_navigation_request(
     state.dirty = true;
     let tx = sender.clone();
     cancellations.insert(tab_id, token.clone());
-    let browser_backend = state.browser_backend.clone();
+    let browser_backend = state.active_browser();
+    let fallback_browser_backend = if browser_backend.is_none() {
+        state.fallback_browser_backend.clone()
+    } else {
+        None
+    };
+    let engine_name = if browser_backend.is_some() {
+        "Chromium"
+    } else {
+        "Lightweight"
+    };
     tokio::spawn(async move {
         let result = async {
             let parsed = HttpClient::parse_url(&url)?;
-            let (mut document, final_url) = if let Some(fields) = post_fields {
+            let (mut document, final_url, diagnostic) = if let Some(fields) = post_fields {
                 let (final_url, source) = client
-                    .submit_form_cancellable(&parsed, fields, token)
+                    .submit_form_cancellable(&parsed, fields, token.clone())
                     .await?;
                 (
                     html::parse(final_url.as_str(), &source),
                     final_url.to_string(),
+                    "Loaded with lightweight engine (form response)".to_owned(),
                 )
             } else if let Some(browser) = browser_backend {
-                let (document, final_url) = browser.render(&url, token).await?;
-                (document, final_url)
+                let (document, final_url) = browser.navigate(tab_id, &url, token).await?;
+                (document, final_url, "Loaded with Chromium".to_owned())
             } else {
                 let (final_url, source) = client
-                    .get_text_with_final_url_cancellable(&parsed, token)
+                    .get_text_with_final_url_cancellable(&parsed, token.clone())
                     .await?;
-                (
-                    html::parse(final_url.as_str(), &source),
-                    final_url.to_string(),
-                )
+                let document = html::parse(final_url.as_str(), &source);
+                let assessment = crate::compatibility::assess(&source, &document);
+                let mut diagnostic = "Loaded with lightweight engine".to_owned();
+                if assessment == crate::compatibility::PageAssessment::JavaScriptShell {
+                    if let Some(browser) = fallback_browser_backend {
+                        tracing::info!(engine = "chromium", reason = "likely JavaScript application shell", url = %url, "using explicitly enabled compatibility fallback");
+                        match browser.navigate(tab_id, &url, token.clone()).await {
+                            Ok((rendered_document, rendered_url)) => (
+                                rendered_document,
+                                rendered_url,
+                                "Loaded with Chromium fallback (JavaScript shell detected)".to_owned(),
+                            ),
+                            Err(WebMorphError::Cancelled) => return Err(WebMorphError::Cancelled),
+                            Err(error) => {
+                                tracing::warn!(%error, reason = "Chromium fallback failed after JavaScript shell detection", "showing lightweight result");
+                                (
+                                    document,
+                                    final_url.to_string(),
+                                    format!("Loaded with lightweight engine; Chromium fallback failed: {error}"),
+                                )
+                            }
+                        }
+                    } else {
+                        (document, final_url.to_string(), "Loaded with lightweight engine; likely JavaScript shell, use --fallback-chromium to try Chromium".to_owned())
+                    }
+                } else {
+                    if assessment == crate::compatibility::PageAssessment::Restricted {
+                        diagnostic = "Loaded with lightweight engine; site displayed an access or bot-check page".to_owned();
+                    } else if assessment == crate::compatibility::PageAssessment::Empty {
+                        diagnostic = "Loaded with lightweight engine; no visible content was found".to_owned();
+                    }
+                    (document, final_url.to_string(), diagnostic)
+                }
             };
             let report = PluginRegistry::default().process(&mut document);
             let mut page = transform(&document);
             crate::plugins::apply_report_to_page(&mut page, report);
-            Ok((page, final_url))
+            Ok((page, final_url, diagnostic))
         }
         .await;
+        let used_chromium = engine_name == "Chromium"
+            || matches!(&result, Ok((_, _, diagnostic)) if diagnostic.starts_with("Loaded with Chromium"));
         let _ = tx.send(NavigationResult {
             request_id: id,
             tab_id,
             history_target,
+            engine_name,
+            is_interaction: false,
+            used_chromium,
             result,
         });
     });
@@ -1325,6 +1537,57 @@ fn normalize_address(input: &str) -> Result<String> {
     HttpClient::parse_url(&candidate).map(|url| url.to_string())
 }
 
+fn begin_browser_interaction(
+    state: &mut UiState,
+    interaction: BrowserInteraction,
+    sender: &mpsc::UnboundedSender<NavigationResult>,
+    request_id: &mut u64,
+    cancellations: &mut HashMap<u64, CancellationToken>,
+) {
+    let Some(browser) = state.active_browser() else {
+        return;
+    };
+    let tab_id = state.tab().id;
+    if let Some(token) = cancellations.remove(&tab_id) {
+        token.cancel();
+    }
+    *request_id = request_id.wrapping_add(1);
+    let id = *request_id;
+    let token = CancellationToken::new();
+    let tab = state.tab_mut();
+    tab.request_id = id;
+    tab.loading = true;
+    tab.error = None;
+    tab.layout_cache = None;
+    state.status = "Updating page in Chromium".into();
+    state.dirty = true;
+    cancellations.insert(tab_id, token.clone());
+    let tx = sender.clone();
+    tokio::spawn(async move {
+        let result = async {
+            let (mut document, final_url) = browser.interact(tab_id, interaction, token).await?;
+            let report = PluginRegistry::default().process(&mut document);
+            let mut page = transform(&document);
+            crate::plugins::apply_report_to_page(&mut page, report);
+            Ok((
+                page,
+                final_url,
+                "Loaded updated page with Chromium".to_owned(),
+            ))
+        }
+        .await;
+        let _ = tx.send(NavigationResult {
+            request_id: id,
+            tab_id,
+            history_target: None,
+            engine_name: "Chromium",
+            is_interaction: true,
+            used_chromium: true,
+            result,
+        });
+    });
+}
+
 fn begin_form_submission(
     state: &mut UiState,
     form_id: &str,
@@ -1334,7 +1597,7 @@ fn begin_form_submission(
     request_id: &mut u64,
     cancellations: &mut HashMap<u64, CancellationToken>,
 ) {
-    let Some(form) = state
+    let Some(mut form) = state
         .tab()
         .page
         .forms
@@ -1346,6 +1609,13 @@ fn begin_form_submission(
         state.dirty = true;
         return;
     };
+    let chromium_mode = state.active_browser().is_some();
+    if chromium_mode {
+        // JavaScript-backed forms work in the real page context. Keep the
+        // ordinary validation checks, but do not reject solely because the
+        // lightweight parser saw a script handler.
+        form.requires_javascript = false;
+    }
     if let Some(error) = validate_form(&form, &state.tab().form_values) {
         state.status = error;
         state.dirty = true;
@@ -1359,6 +1629,22 @@ fn begin_form_submission(
     {
         state.status = "GET form with a password field blocked to protect the password from appearing in the URL".into();
         state.dirty = true;
+        return;
+    }
+    if chromium_mode {
+        let interaction = if let Some(submitter) = submitter {
+            BrowserInteraction::Click {
+                interactive_id: submitter.to_owned(),
+            }
+        } else {
+            let form_index = form
+                .id
+                .strip_prefix("form-")
+                .and_then(|index| index.parse().ok())
+                .unwrap_or(0);
+            BrowserInteraction::SubmitForm { form_index }
+        };
+        begin_browser_interaction(state, interaction, sender, request_id, cancellations);
         return;
     }
     let Ok(mut action) = HttpClient::parse_url(&form.action) else {
@@ -1589,7 +1875,7 @@ fn validate_form(form: &FormDefinition, values: &FormValues) -> Option<String> {
             .iter()
             .any(|field| field.control_type == "password")
     {
-        return Some("Password forms cannot use GET; use a POST form instead".into());
+        return Some("GET form with a password field blocked to protect the password from appearing in the URL".into());
     }
     for field in form.controls.iter().filter(|field| !field.disabled) {
         let value = values
@@ -1911,13 +2197,29 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancellationToken, Focus, HashMap, HttpClient, Theme, UiAction, UiState, Zeroizing, mpsc,
-        visible_window,
+        BrowserBackend, BrowserInteraction, CancellationToken, Focus, HashMap, HttpClient, Theme,
+        UiAction, UiState, Zeroizing, mpsc, visible_window,
     };
     use crate::{dom::Document, html, transform::transform};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+
+    struct StubBrowser;
+
+    impl BrowserBackend for StubBrowser {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn render<'a>(
+            &'a self,
+            _url: &'a str,
+            _cancellation: CancellationToken,
+        ) -> crate::browser::BrowserFuture<'a> {
+            Box::pin(async { Err(crate::error::WebMorphError::Browser("test backend".into())) })
+        }
+    }
 
     fn state() -> UiState {
         let doc = html::parse(
@@ -1932,7 +2234,7 @@ mod tests {
         let rows: Vec<_> = (0..10_000).collect();
         assert_eq!(visible_window(&rows, 0, 3), [0, 1, 2]);
         assert_eq!(visible_window(&rows, 5_000, 2), [5_000, 5_001]);
-        assert_eq!(visible_window(&rows, 20_000, 3), []);
+        assert!(visible_window(&rows, 20_000, 3).is_empty());
     }
 
     fn form_state(source: &str) -> UiState {
@@ -1954,6 +2256,46 @@ mod tests {
             ui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             UiAction::Navigate("https://example.org".into())
         );
+    }
+
+    #[test]
+    fn chromium_mode_turns_tui_activations_into_browser_dom_actions() {
+        let mut ui = state();
+        ui.browser_backend = Some(std::sync::Arc::new(StubBrowser));
+        ui.tab_mut().chromium_session = true;
+        assert!(matches!(
+            ui.activate(false),
+            UiAction::BrowserInteraction(BrowserInteraction::Click { .. })
+        ));
+
+        let mut ui = form_state(
+            r#"<form><input id="query" name="q" aria-label="Query"><select id="sort" name="sort"><option value="new">New</option><option value="old">Old</option></select></form>"#,
+        );
+        ui.browser_backend = Some(std::sync::Arc::new(StubBrowser));
+        ui.tab_mut().chromium_session = true;
+        ui.activate(false);
+        ui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            ui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiAction::BrowserInteraction(BrowserInteraction::SetValue { value, .. }) if value == "x"
+        ));
+
+        ui.selected_interactive = 1;
+        assert!(matches!(
+            ui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            UiAction::BrowserInteraction(BrowserInteraction::SelectOption { value, .. }) if value == "old"
+        ));
+    }
+
+    #[test]
+    fn javascript_fallback_tabs_keep_their_browser_backend_for_actions() {
+        let mut ui = state();
+        ui.fallback_browser_backend = Some(std::sync::Arc::new(StubBrowser));
+        ui.tab_mut().chromium_session = true;
+        assert!(matches!(
+            ui.activate(false),
+            UiAction::BrowserInteraction(BrowserInteraction::Click { .. })
+        ));
     }
 
     #[test]

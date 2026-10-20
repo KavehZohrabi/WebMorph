@@ -96,15 +96,13 @@ impl HttpClient {
                 let target = attempt.url();
                 let blocked = attempt.previous().len() >= redirects
                     || !matches!(target.scheme(), "http" | "https")
+                    || !target.username().is_empty()
+                    || target.password().is_some()
                     || !allow_private_network && is_blocked_redirect(target)
                     || attempt
                         .previous()
                         .iter()
-                        .any(|previous| previous.scheme() == "https" && target.scheme() == "http")
-                    || attempt
-                        .previous()
-                        .first()
-                        .is_some_and(|first| first.host_str() != target.host_str());
+                        .any(|previous| previous.scheme() == "https" && target.scheme() == "http");
                 if blocked {
                     attempt.stop()
                 } else {
@@ -177,6 +175,12 @@ impl HttpClient {
             result = self.client.get(url).header(ACCEPT, "text/html,application/xhtml+xml;q=0.9").send() => result.map_err(classify_reqwest)?,
         };
         self.validate_response(&response)?;
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
         let final_url = response.url().clone();
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
@@ -198,9 +202,7 @@ impl HttpClient {
                 }
             }
         }
-        let body = String::from_utf8(body).map_err(|_| {
-            WebMorphError::UnsupportedContent("HTML response is not valid UTF-8".into())
-        })?;
+        let body = decode_html(body, &content_type)?;
         Ok((final_url, body))
     }
 
@@ -231,6 +233,12 @@ impl HttpClient {
             result = self.client.post(url).header(ACCEPT, "text/html,application/xhtml+xml;q=0.9").form(&fields.0).send() => result.map_err(classify_reqwest)?,
         };
         self.validate_response(&response)?;
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
         let final_url = response.url().clone();
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
@@ -252,9 +260,7 @@ impl HttpClient {
                 }
             }
         }
-        let body = String::from_utf8(body).map_err(|_| {
-            WebMorphError::UnsupportedContent("HTML response is not valid UTF-8".into())
-        })?;
+        let body = decode_html(body, &content_type)?;
         Ok((final_url, body))
     }
 
@@ -296,7 +302,16 @@ impl HttpClient {
     }
 
     fn validate_response(&self, response: &Response) -> Result<()> {
+        if response.status().is_redirection() {
+            return Err(WebMorphError::Redirect(response.status().as_u16()));
+        }
         if !response.status().is_success() {
+            match response.status().as_u16() {
+                401 => return Err(WebMorphError::AuthenticationRequired),
+                403 => return Err(WebMorphError::AccessDenied),
+                429 => return Err(WebMorphError::RateLimited),
+                _ => {}
+            }
             return Err(WebMorphError::HttpStatus(response.status().as_u16()));
         }
         let content_type = response
@@ -329,6 +344,66 @@ impl HttpClient {
         }
         Ok(())
     }
+}
+
+/// Decode HTML using its byte-order mark or declared charset. Valid UTF-8 is
+/// preserved; legacy HTML without a declaration follows the HTML default
+/// (Windows-1252), avoiding a blank/error page for common older sites.
+fn decode_html(bytes: Vec<u8>, content_type: &str) -> Result<String> {
+    if let Some((encoding, length)) = encoding_rs::Encoding::for_bom(&bytes) {
+        return Ok(encoding.decode(&bytes[length..]).0.into_owned());
+    }
+    let charset = content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches(['\"', '\'']).to_owned())
+    });
+    if let Some(encoding) = charset
+        .as_deref()
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+    {
+        return Ok(encoding.decode(&bytes).0.into_owned());
+    }
+    if let Some(label) = meta_charset(&bytes)
+        && let Some(encoding) = encoding_rs::Encoding::for_label(label.as_bytes())
+    {
+        return Ok(encoding.decode(&bytes).0.into_owned());
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(error) => Ok(encoding_rs::WINDOWS_1252
+            .decode(error.as_bytes())
+            .0
+            .into_owned()),
+    }
+}
+
+fn meta_charset(bytes: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+    let mut rest = head.as_str();
+    while let Some(index) = rest.find("<meta") {
+        rest = &rest[index + 5..];
+        let end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..end];
+        if let Some(index) = tag.find("charset") {
+            let value = tag[index + "charset".len()..]
+                .trim_start()
+                .strip_prefix('=')?
+                .trim_start();
+            let quote = value.chars().next()?;
+            let value = if quote == '\'' || quote == '"' {
+                value[1..].split(quote).next()?
+            } else {
+                value.split([' ', '/', ';']).next()?
+            };
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+        rest = rest.get(end..)?;
+    }
+    None
 }
 
 /// Validate the addresses used by reqwest itself, closing the gap between an
@@ -410,10 +485,20 @@ fn is_special_ipv4(octets: [u8; 4]) -> bool {
 /// rather than resolving it again in a child browser process.
 #[cfg(feature = "browser-engine")]
 pub(crate) async fn resolve_public_destination(url: &Url) -> Result<Vec<IpAddr>> {
+    resolve_http_destination(url, false).await
+}
+
+#[cfg(feature = "browser-engine")]
+pub(crate) async fn resolve_http_destination(
+    url: &Url,
+    allow_private_network: bool,
+) -> Result<Vec<IpAddr>> {
     let host = url
         .host_str()
         .ok_or_else(|| WebMorphError::InvalidUrl("missing host".into()))?;
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+    if !allow_private_network
+        && (host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost"))
+    {
         return Err(WebMorphError::InvalidUrl(
             "local network destinations are blocked".into(),
         ));
@@ -435,7 +520,7 @@ pub(crate) async fn resolve_public_destination(url: &Url) -> Result<Vec<IpAddr>>
             "hostname resolved to no addresses".into(),
         ));
     }
-    if addresses.iter().any(is_non_public) {
+    if !allow_private_network && addresses.iter().any(is_non_public) {
         return Err(WebMorphError::InvalidUrl(
             "local or private network destinations are blocked".into(),
         ));
@@ -463,6 +548,11 @@ fn classify_reqwest(error: reqwest::Error) -> WebMorphError {
         let lower = msg.to_ascii_lowercase();
         if lower.contains("timed out") || lower.contains("timeout") {
             WebMorphError::Timeout
+        } else if ["tls", "certificate", "cert verify", "handshake"]
+            .iter()
+            .any(|part| lower.contains(part))
+        {
+            WebMorphError::Tls(msg)
         } else if ["dns", "resolve", "lookup", "name or service"]
             .iter()
             .any(|part| lower.contains(part))
@@ -472,13 +562,22 @@ fn classify_reqwest(error: reqwest::Error) -> WebMorphError {
             WebMorphError::Connection(msg)
         }
     } else {
-        WebMorphError::Connection(error.to_string())
+        let message = error.to_string();
+        let lower = message.to_ascii_lowercase();
+        if ["tls", "certificate", "cert verify", "handshake"]
+            .iter()
+            .any(|part| lower.contains(part))
+        {
+            WebMorphError::Tls(message)
+        } else {
+            WebMorphError::Connection(message)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpClient, HttpConfig, is_non_public};
+    use super::{HttpClient, HttpConfig, decode_html, is_non_public};
     use std::time::Duration;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -487,7 +586,40 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    async fn serve(response: &'static str) -> String {
+    #[test]
+    fn decodes_html_bom_and_declared_legacy_charset() {
+        assert_eq!(
+            decode_html(
+                b"<p>caf\xe9</p>".to_vec(),
+                "text/html; charset=windows-1252"
+            )
+            .unwrap(),
+            "<p>café</p>"
+        );
+        assert_eq!(
+            decode_html(
+                b"\xef\xbb\xbf<p>ok</p>".to_vec(),
+                "text/html; charset=windows-1252"
+            )
+            .unwrap(),
+            "<p>ok</p>"
+        );
+        assert_eq!(
+            decode_html(
+                b"<meta charset=\"windows-1252\"><p>caf\xe9</p>".to_vec(),
+                "text/html"
+            )
+            .unwrap(),
+            "<meta charset=\"windows-1252\"><p>café</p>"
+        );
+        assert_eq!(
+            decode_html(b"<p>ok</p>".to_vec(), "text/html").unwrap(),
+            "<p>ok</p>"
+        );
+    }
+
+    async fn serve(response: impl Into<String>) -> String {
+        let response = response.into();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -605,6 +737,31 @@ mod tests {
                 .await,
             Err(crate::error::WebMorphError::UnsupportedContent(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn classifies_authentication_access_denial_and_rate_limits() {
+        for (status, expected) in [
+            ("401 Unauthorized", 401),
+            ("403 Forbidden", 403),
+            ("429 Too Many Requests", 429),
+        ] {
+            let response =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let url = serve(response).await;
+            let error = local_client()
+                .get_text(&HttpClient::parse_url(&url).unwrap())
+                .await
+                .unwrap_err();
+            match expected {
+                401 => assert!(matches!(
+                    error,
+                    crate::error::WebMorphError::AuthenticationRequired
+                )),
+                403 => assert!(matches!(error, crate::error::WebMorphError::AccessDenied)),
+                _ => assert!(matches!(error, crate::error::WebMorphError::RateLimited)),
+            }
+        }
     }
 
     #[tokio::test]

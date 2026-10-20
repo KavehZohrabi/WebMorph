@@ -43,6 +43,29 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
     };
+    let fallback_browser: Option<Arc<dyn BrowserBackend>> = if cli.fallback_chromium {
+        #[cfg(feature = "browser-engine")]
+        {
+            Some(Arc::new(
+                crate::browser::ChromiumEngine::detect()?.with_config(
+                    crate::browser::ChromiumConfig {
+                        navigation_timeout: std::time::Duration::from_secs(
+                            settings.request_timeout_seconds,
+                        ),
+                        ..crate::browser::ChromiumConfig::default()
+                    },
+                ),
+            ))
+        }
+        #[cfg(not(feature = "browser-engine"))]
+        {
+            return Err(WebMorphError::BrowserUnavailable(
+                "--fallback-chromium requires a build with --features browser-engine".into(),
+            ));
+        }
+    } else {
+        None
+    };
     let mut terminal = TerminalSession::new()?;
     let http_config = HttpConfig {
         request_timeout: std::time::Duration::from_secs(settings.request_timeout_seconds),
@@ -55,6 +78,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             HttpClient::new(http_config)?,
             storage,
             browser,
+            fallback_browser,
         )
         .await
 }

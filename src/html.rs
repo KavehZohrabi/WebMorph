@@ -120,6 +120,34 @@ fn parse_element(
             children: vec![],
         })
     };
+    if tag != "button" && element.value().attr("role") == Some("button") {
+        let text = text_of(element);
+        let label = if text.is_empty() {
+            element
+                .value()
+                .attr("aria-label")
+                .or_else(|| element.value().attr("title"))
+                .unwrap_or("")
+                .to_owned()
+        } else {
+            text
+        };
+        let id = add_interactive(
+            document,
+            ordinal,
+            InteractiveKind::Button,
+            label,
+            element.value().attr("name").map(str::to_owned),
+            None,
+            Some("button".into()),
+            None,
+            None,
+            None,
+            element.value().attr("aria-disabled") == Some("true"),
+            browser_key(element),
+        );
+        return leaf(ContentKind::Button { interactive_id: id });
+    }
     match tag {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => leaf(ContentKind::Heading {
             level: tag[1..].parse().unwrap_or(1),
@@ -134,12 +162,22 @@ fn parse_element(
         "a" => {
             let href = resolve(base, element.value().attr("href"));
             let text = text_of(element);
+            let label = if text.is_empty() {
+                element
+                    .value()
+                    .attr("aria-label")
+                    .or_else(|| element.value().attr("title"))
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                text.clone()
+            };
             let id = href.as_ref().map(|_| {
                 add_interactive(
                     document,
                     ordinal,
                     InteractiveKind::Link,
-                    text.clone(),
+                    label,
                     None,
                     None,
                     None,
@@ -147,7 +185,7 @@ fn parse_element(
                     None,
                     None,
                     element.value().attr("aria-disabled") == Some("true"),
-                    element.value().attr("id").map(str::to_owned),
+                    browser_key(element),
                 )
             });
             leaf(ContentKind::Link {
@@ -236,14 +274,19 @@ fn parse_element(
                 None,
                 element.value().attr("placeholder").map(str::to_owned),
                 element.value().attr("disabled").is_some(),
-                element.value().attr("id").map(str::to_owned),
+                browser_key(element),
             );
             leaf(ContentKind::Input { interactive_id: id })
         }
         "button" => {
             let text = text_of(element);
             let label = if text.is_empty() {
-                element.value().attr("aria-label").unwrap_or("").to_owned()
+                element
+                    .value()
+                    .attr("aria-label")
+                    .or_else(|| element.value().attr("title"))
+                    .unwrap_or("")
+                    .to_owned()
             } else {
                 text
             };
@@ -259,7 +302,7 @@ fn parse_element(
                 None,
                 None,
                 element.value().attr("disabled").is_some(),
-                element.value().attr("id").map(str::to_owned),
+                browser_key(element),
             );
             leaf(ContentKind::Button { interactive_id: id })
         }
@@ -300,9 +343,13 @@ fn parse_element(
                     text: text_of(element),
                 })
             } else {
-                walk_children(element, base, document, ordinal)
-                    .into_iter()
-                    .next()
+                let children = walk_children(element, base, document, ordinal);
+                (!children.is_empty()).then_some(ContentNode {
+                    kind: ContentKind::Text {
+                        text: String::new(),
+                    },
+                    children,
+                })
             }
         }
     }
@@ -410,8 +457,8 @@ fn parse_forms(html: &Html, document: &mut Document, base: Option<&Url>) -> Vec<
                 _ => "select".into(),
             };
             let name = element.value().attr("name").map(str::to_owned);
-            let html_id = element.value().attr("id");
-            let queue = if let Some(id) = html_id {
+            let html_id = browser_key(element);
+            let queue = if let Some(id) = html_id.as_deref() {
                 ids_by_html.get_mut(id)
             } else {
                 name.as_deref().and_then(|name| {
@@ -567,6 +614,14 @@ fn resolve(base: Option<&Url>, value: Option<&str>) -> Option<String> {
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https"))
         .map(|url| url.to_string())
+}
+
+fn browser_key(element: ElementRef<'_>) -> Option<String> {
+    element
+        .value()
+        .attr("data-webmorph-key")
+        .or_else(|| element.value().attr("id"))
+        .map(str::to_owned)
 }
 
 fn text_of(element: ElementRef<'_>) -> String {

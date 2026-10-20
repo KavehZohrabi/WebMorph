@@ -11,3 +11,6 @@ pub mod transform;
 pub mod tui;
 
 pub mod browser;
+#[cfg(feature = "browser-engine")]
+mod browser_proxy;
+pub mod compatibility;

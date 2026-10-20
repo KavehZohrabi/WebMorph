@@ -159,9 +159,7 @@ remain important.
 - Forms driven by JavaScript, CAPTCHA, file upload, multipart encoding, and
   complex browser authentication flows are unsupported. WebMorph does not
   bypass authentication or CAPTCHA.
-- Chromium is optional, starts a fresh browser for a page load, and has
-  restrictive network/resource policy. It is not a persistent general-purpose
-  browser and does not preserve cookies or support TUI-driven JavaScript forms.
+- Chromium is optional and keeps an isolated session per tab for JavaScript-backed interactions. It supports mapped clicks, text entry, selects, form submission, and scrolling, with a restrictive network/resource policy. It is not a complete browser and does not persist cookies or profiles.
 - Bookmarks, history search/deletion, and settings are storage APIs and are not
   yet exposed as interactive application screens.
 - Compatibility depends on the terminal's Unicode, mouse, and key-event

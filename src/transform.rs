@@ -173,6 +173,15 @@ pub fn transform_for_width(document: &Document, width: usize) -> TuiPage {
             children.push(map_node(node, &interactive));
         }
     }
+    if children.is_empty() {
+        children.push(Component {
+            kind: ComponentKind::InfoPanel {
+                title: "No readable page content".into(),
+                text: "The server returned HTML, but WebMorph could not find visible text or supported controls. The page may require JavaScript or use an unsupported layout.".into(),
+            },
+            children: vec![],
+        });
+    }
     if !document.unsupported_elements.is_empty() {
         let count = document.unsupported_elements.len();
         children.push(Component {
