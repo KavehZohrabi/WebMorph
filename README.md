@@ -235,16 +235,20 @@ there are no npm tokens in the repository. A partial registry publish is not
 atomic: the workflow stops before publishing the main package and requires
 manual recovery of already-published platform versions before retrying.
 
-Before enabling a tagged release, an npm maintainer must own the
-`@kavehzohrabi` scope, create public Trusted Publisher entries for this
-repository and `.github/workflows/npm-release.yml` (including the `npm-release`
-environment), configure any required environment protection in GitHub, and set
-the `NPM_RELEASE_READY=true` repository Actions variable after verification.
-The publisher setup is documented at
-[npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers). A
-`workflow_dispatch` run performs the build and package checks without
-publishing. Do not create a release tag until the registry publisher setup and
-dry-run workflow have been verified.
+For a new npm package, Trusted Publishing cannot be configured until that
+package exists on the registry. The first 0.1.0 publication must therefore be
+bootstrapped once from the authenticated npm account, using artifacts from a
+successful `workflow_dispatch` build: publish the six platform packages first
+and the main package last. `workflow_dispatch` itself never publishes. After
+the packages exist, configure a GitHub Actions Trusted Publisher separately
+for each package using GitHub user `KavehZohrabi`, repository `WebMorph`,
+workflow filename `npm-release.yml`, environment `npm-release`, and direct
+`npm publish` permission. Then create/configure the GitHub environment and set
+`NPM_RELEASE_READY=true`. The exact steps are in
+[docs/npm-distribution.md](docs/npm-distribution.md) and npm's
+[Trusted Publishing guide](https://docs.npmjs.com/trusted-publishers). Do not
+create a release tag until the publisher entries and dry-run workflow have
+been verified.
 
 To align a future Rust version bump, update every platform manifest and the
 root npm manifest to the `Cargo.toml` version; CI checks this before packaging.

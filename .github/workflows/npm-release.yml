@@ -95,6 +95,8 @@ jobs:
         run: node --test test/launcher.test.cjs
       - name: Verify tarball contents
         run: npm pack --dry-run --json | node npm/scripts/verify-pack.cjs
+      - name: Prepare npm tarball directory
+        run: mkdir -p target/npm-tarballs
       - name: Upload main package tarball
         run: npm pack --pack-destination target/npm-tarballs
       - uses: actions/upload-artifact@v4
