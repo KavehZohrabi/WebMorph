@@ -101,6 +101,8 @@ jobs:
         run: npm pack ./target/npm-platform --pack-destination target/npm-tarballs --json | node npm/scripts/verify-platform-pack.cjs ${{ matrix.target }} target/release/webmorph${{ startsWith(matrix.target, 'win32-') && '.exe' || '' }}
       - name: Stage local native package for wrapper tests
         run: node npm/scripts/install-local-binary.cjs ${{ matrix.target }} target/release/webmorph${{ startsWith(matrix.target, 'win32-') && '.exe' || '' }}
+      - name: Verify CLI argument forwarding
+        run: node npm/scripts/smoke-cli.cjs
       - name: Test npm launcher
         run: npm test
       - name: Verify npm package contents
