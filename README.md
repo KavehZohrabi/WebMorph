@@ -187,6 +187,15 @@ Bug reports and focused contributions are welcome. Read
 checks, linting, and tests locally. Please do not include credentials, cookies,
 private browsing data, or unlicensed third-party content in issues or patches.
 
+## Compatibility testing
+
+Run the deterministic local website suite and generate a Markdown report with
+`cargo run --locked --bin compatibility-report -- --output target/compatibility-report.md`.
+Optional Chromium checks require `--features browser-engine` and an installed
+browser. Public-site smoke checks are opt-in with `--live-smoke`. See
+[docs/compatibility-testing.md](docs/compatibility-testing.md) for report fields
+and how CI separates implementation failures from network availability.
+
 ## Security
 
 Please report security issues privately as described in [SECURITY.md](SECURITY.md).

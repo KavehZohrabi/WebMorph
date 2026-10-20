@@ -179,6 +179,12 @@ mod chromium {
             self
         }
 
+        /// Return the number of live browser sessions currently owned by this engine.
+        /// This is useful for diagnostics and resource-lifecycle verification.
+        pub async fn active_session_count(&self) -> usize {
+            self.sessions.lock().await.len()
+        }
+
         pub fn executable(&self) -> &std::path::Path {
             &self.executable
         }

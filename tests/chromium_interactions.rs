@@ -58,13 +58,16 @@ fn text(page: &webmorph::dom::Document) -> String {
 #[tokio::test]
 async fn persistent_chromium_session_applies_real_dom_actions_and_refreshes_tui_document() {
     let url = local_page().await;
-    let engine = ChromiumEngine::detect()
-        .unwrap()
-        .with_config(ChromiumConfig {
-            allow_private_network: true,
-            navigation_timeout: std::time::Duration::from_secs(12),
-            ..ChromiumConfig::default()
-        });
+    let Ok(engine) = ChromiumEngine::detect() else {
+        eprintln!("Chromium interaction integration skipped: no browser executable installed");
+        return;
+    };
+    let engine = engine.with_config(ChromiumConfig {
+        allow_private_network: true,
+        navigation_timeout: std::time::Duration::from_secs(12),
+        ..ChromiumConfig::default()
+    });
+    let started = std::time::Instant::now();
     let token = CancellationToken::new();
     let (page, _) = engine.navigate(17, &url, token.clone()).await.unwrap();
     assert!(text(&page).contains("Ready"));
@@ -250,6 +253,11 @@ async fn persistent_chromium_session_applies_real_dom_actions_and_refreshes_tui_
         .unwrap();
     assert!(text(&page).contains("Scroll: 600"));
     engine.close_session(17).await;
+    assert_eq!(engine.active_session_count().await, 0);
+    eprintln!(
+        "Chromium local compatibility: navigation, dynamic action, form, SPA route, scrolling; {:.2} ms; sessions after close: 0",
+        started.elapsed().as_secs_f64() * 1_000.0
+    );
 }
 
 #[test]

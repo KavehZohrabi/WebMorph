@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head><title>Dynamic application</title></head>
+  <body>
+    <div id="root"></div>
+    <script>
+      window.addEventListener('DOMContentLoaded', () => {
+        const root = document.querySelector('#root');
+        root.innerHTML = `<main><h1 id="state">JavaScript ready</h1>
+          <button id="update" aria-label="Update status">Update</button>
+          <a id="client-route" href="/client-route">Open client route</a></main>`;
+        document.querySelector('#update').addEventListener('click', () => {
+          document.querySelector('#state').textContent = 'Dynamic content updated';
+        });
+        document.querySelector('#client-route').addEventListener('click', event => {
+          event.preventDefault();
+          history.pushState({}, '', '/client-route');
+          document.querySelector('#state').textContent = 'Client route rendered';
+        });
+      });
+    </script>
+  </body>
+</html>

@@ -2361,9 +2361,10 @@ impl Drop for TerminalSession {
 mod tests {
     use super::{
         BrowserBackend, BrowserInteraction, CancellationToken, Focus, HashMap, HttpClient,
-        PresentationMode, Theme, UiAction, UiState, Zeroizing, mpsc, visible_window,
+        PresentationMode, Theme, UiAction, UiState, Zeroizing, begin_navigation, mpsc,
+        visible_window,
     };
-    use crate::{dom::Document, html, transform::transform};
+    use crate::{dom::Document, html, network::HttpConfig, transform::transform};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -2459,6 +2460,78 @@ mod tests {
             ui.activate(false),
             UiAction::BrowserInteraction(BrowserInteraction::Click { .. })
         ));
+    }
+
+    struct FallbackBrowser;
+
+    impl BrowserBackend for FallbackBrowser {
+        fn name(&self) -> &'static str {
+            "fallback-test"
+        }
+
+        fn render<'a>(
+            &'a self,
+            url: &'a str,
+            _cancellation: CancellationToken,
+        ) -> crate::browser::BrowserFuture<'a> {
+            Box::pin(async move {
+                let mut document = Document::new(url, "Browser rendered application");
+                document.content.push(crate::dom::ContentNode {
+                    kind: crate::dom::ContentKind::Paragraph {
+                        text: "Rendered by the fallback browser".into(),
+                    },
+                    children: vec![],
+                });
+                Ok((document, url.to_owned()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn javascript_shell_uses_explicitly_configured_browser_fallback() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            let body = "<div id='root'></div><script type='module' src='/app.js'></script>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut state = state();
+        state.fallback_browser_backend = Some(std::sync::Arc::new(FallbackBrowser));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut request_id = 0;
+        let mut cancellations = HashMap::new();
+        begin_navigation(
+            &mut state,
+            format!("http://{address}/"),
+            HttpClient::new(HttpConfig {
+                allow_private_network: true,
+                ..HttpConfig::default()
+            })
+            .unwrap(),
+            &sender,
+            &mut request_id,
+            &mut cancellations,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.used_chromium);
+        let (_, _, diagnostic) = result.result.unwrap();
+        assert!(diagnostic.contains("Chromium fallback"));
     }
 
     #[test]
