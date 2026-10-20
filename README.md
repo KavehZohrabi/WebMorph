@@ -27,6 +27,29 @@ interaction; it is not a full browser.
 
 ## Installation
 
+### Install the packaged CLI with npm
+
+After the npm packages are published, install the platform-matched native
+binary and the small Node.js launcher globally:
+
+```sh
+npm install --global @kaveh-zohrabi/webmorph
+webmorph https://example.com
+```
+
+The npm package does not compile Rust or run a post-install downloader. npm
+installs the selected native binary as a regular optional package for Linux
+x64/ARM64, Windows x64/ARM64, and macOS Intel/Apple Silicon. npm selects the
+package for the current platform;
+the launcher starts the original Rust CLI, passes all arguments through, and
+inherits terminal input/output for the TUI. Node.js 18 or newer is required.
+
+If an architecture package is missing, install from the source checkout using
+the Cargo instructions below. The `webmorph` npm name was unavailable when the
+package was checked, so this distribution uses the `@kaveh-zohrabi/webmorph`
+scope. npm scope ownership and Trusted Publisher authorization must be
+confirmed before the first release.
+
 The first release is built from source with a current stable Rust toolchain
 (edition 2024). Clone the repository, then install the executable:
 
@@ -172,6 +195,9 @@ remain important.
   yet exposed as interactive application screens.
 - Compatibility depends on the terminal's Unicode, mouse, and key-event
   support. No claim is made that all sites or terminals work identically.
+- The npm Linux binaries target GNU libc (glibc) 2.35 or newer. Alpine/musl
+  Linux is not currently packaged; use a compatible glibc distribution or
+  install WebMorph from source.
 - Large documents are rendered from a bounded scrolling window. Layout still
   walks the component tree when that window moves outside the cached range, so
   exceptionally large, deeply nested pages can take longer to scroll.
@@ -195,6 +221,35 @@ Optional Chromium checks require `--features browser-engine` and an installed
 browser. Public-site smoke checks are opt-in with `--live-smoke`. See
 [docs/compatibility-testing.md](docs/compatibility-testing.md) for report fields
 and how CI separates implementation failures from network availability.
+
+## npm release maintenance
+
+The root `package.json` is a launcher only. Platform packages contain the
+original release executable; versions in the root manifest, platform package
+manifests, Cargo metadata, and Git tags use the same `0.1.0` / `v0.1.0` version.
+The `npm-release.yml` workflow builds and tests every supported native target,
+publishes the six platform packages first, then publishes the main package.
+Duplicate versions fail preflight, and any binary build or package test failure
+prevents publishing. npm publication uses GitHub Actions OIDC and provenance;
+there are no npm tokens in the repository. A partial registry publish is not
+atomic: the workflow stops before publishing the main package and requires
+manual recovery of already-published platform versions before retrying.
+
+Before enabling a tagged release, an npm maintainer must own the
+`@kaveh-zohrabi` scope, create public Trusted Publisher entries for this
+repository and `.github/workflows/npm-release.yml` (including the `npm-release`
+environment), configure any required environment protection in GitHub, and set
+the `NPM_RELEASE_READY=true` repository Actions variable after verification.
+The publisher setup is documented at
+[npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers). A
+`workflow_dispatch` run performs the build and package checks without
+publishing. Do not create a release tag until the registry publisher setup and
+dry-run workflow have been verified.
+
+To align a future Rust version bump, update every platform manifest and the
+root npm manifest to the `Cargo.toml` version; CI checks this before packaging.
+See [docs/npm-distribution.md](docs/npm-distribution.md) for package layout,
+release gates, and troubleshooting.
 
 ## Security
 

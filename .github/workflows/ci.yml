@@ -63,3 +63,44 @@ jobs:
           name: compatibility-chromium-ubuntu
           path: target/compatibility-report-chromium.md
           if-no-files-found: warn
+
+  npm-cli:
+    name: npm CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-22.04
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+          - target: win32-x64
+            runner: windows-2025
+          - target: win32-arm64
+            runner: windows-11-arm
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: darwin-arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check version alignment
+        run: node npm/scripts/check-versions.cjs
+      - name: Confirm native runner architecture
+        run: node npm/scripts/check-runner.cjs ${{ matrix.target }}
+      - name: Build and test native CLI
+        run: cargo test --locked && cargo build --release --locked
+      - name: Stage local native package for wrapper tests
+        run: node npm/scripts/install-local-binary.cjs ${{ matrix.target }} target/release/webmorph${{ startsWith(matrix.target, 'win32-') && '.exe' || '' }}
+      - name: Test npm launcher
+        run: npm test
+      - name: Verify npm package contents
+        run: npm pack --dry-run --json | node npm/scripts/verify-pack.cjs
+      - name: Smoke-test interactive TUI in a pseudo-terminal
+        if: matrix.target == 'linux-x64'
+        run: (sleep 2; printf '\021') | timeout 20s script -q -e -c 'node bin/webmorph.js --private http://127.0.0.1:1' /dev/null

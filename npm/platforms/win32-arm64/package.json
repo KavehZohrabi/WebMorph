@@ -1,0 +1,21 @@
+{
+  "name": "@kaveh-zohrabi/webmorph-win32-arm64",
+  "version": "0.1.0",
+  "description": "WebMorph native executable for win32/arm64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kaveh-zohrabi/WebMorph.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/webmorph",
+    "bin/webmorph.exe",
+    "LICENSE"
+  ]
+}

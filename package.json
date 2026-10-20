@@ -1,0 +1,37 @@
+{
+  "name": "@kaveh-zohrabi/webmorph",
+  "version": "0.1.0",
+  "description": "Transform websites into interactive terminal user interfaces",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kaveh-zohrabi/WebMorph.git"
+  },
+  "homepage": "https://github.com/kaveh-zohrabi/WebMorph#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/kaveh-zohrabi/WebMorph/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "webmorph": "bin/webmorph.js"
+  },
+  "files": [
+    "bin/webmorph.js"
+  ],
+  "optionalDependencies": {
+    "@kaveh-zohrabi/webmorph-linux-x64": "0.1.0",
+    "@kaveh-zohrabi/webmorph-linux-arm64": "0.1.0",
+    "@kaveh-zohrabi/webmorph-win32-x64": "0.1.0",
+    "@kaveh-zohrabi/webmorph-win32-arm64": "0.1.0",
+    "@kaveh-zohrabi/webmorph-darwin-x64": "0.1.0",
+    "@kaveh-zohrabi/webmorph-darwin-arm64": "0.1.0"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
